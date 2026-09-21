@@ -8,6 +8,13 @@ on:
 permissions:
   contents: read
 
+# Both jobs assume a GitHub-hosted runner: shellcheck is preinstalled and the
+# npm registry is reachable. On a self-hosted or network-restricted runner they
+# fail for reasons unrelated to the code under test.
+env:
+  # Pinned so a new CLI release cannot turn this suite red on its own.
+  FACET_CLI_PIN: '0.33.1'
+
 jobs:
   script:
     name: facet-update.sh
@@ -30,22 +37,100 @@ jobs:
           FACET_CLI_VERSION='1.0.0 && echo pwned' bash scripts/facet-update.sh
           [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
 
+      # grep anchors per line, so this payload passes a grep-based check. The
+      # script uses [[ =~ ]] precisely so it does not.
+      - name: Rejects a multi-line cli-version
+        run: |
+          set +e
+          FACET_CLI_VERSION=$'1.0.0\n; touch /tmp/pwned' bash scripts/facet-update.sh
+          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
+          [ ! -f /tmp/pwned ] || { echo "payload executed"; exit 1; }
+
+      - name: Refuses to run without a lockfile
+        run: |
+          set +e
+          mkdir -p /tmp/nolock && cd /tmp/nolock
+          printf '{ "facets": {}, "manifestVersion": 0.1 }\n' > facets.json
+          FACET_WORKING_DIR=/tmp/nolock bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
+          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
+
       - name: Detects a real update
         run: |
           set -euo pipefail
           mkdir -p /tmp/fixture && cd /tmp/fixture
           git init -q . && git config user.email t@t && git config user.name t
           printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
-          npx --yes agent-facets@latest install --accept-mcp < /dev/null
+          npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null
           git add -A && git commit -qm init
-          FACET_OUTPUT=/tmp/out.txt FACET_STRATEGY=latest \
+          FACET_OUTPUT=/tmp/out.txt FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
             bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
           grep -q '^updated=true' /tmp/out.txt || { cat /tmp/out.txt; exit 1; }
+
+      # Detection must not depend on git seeing the lockfile: this is the
+      # regression that shipped updated=false while a facet had actually moved.
+      - name: Detects an update whose lockfile is gitignored
+        run: |
+          set -euo pipefail
+          cd /tmp/fixture
+          printf 'facets.lock\n' > .gitignore
+          git rm -q --cached facets.lock
+          git add -A && git commit -qm ignore-lock
+          node -e '
+            const fs = require("fs")
+            const lock = JSON.parse(fs.readFileSync("facets.lock", "utf8"))
+            for (const e of Object.values(lock.facets)) e.version = "1.0.0"
+            fs.writeFileSync("facets.lock", JSON.stringify(lock, null, 2) + "\n")
+          '
+          FACET_OUTPUT=/tmp/out-ignored.txt FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
+            bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
+          grep -q '^updated=true' /tmp/out-ignored.txt || { cat /tmp/out-ignored.txt; exit 1; }
 
       - name: Reports no change when everything is current
         run: |
           set -euo pipefail
-          cd /tmp/fixture && git add -A && git commit -qm applied
-          FACET_OUTPUT=/tmp/out2.txt FACET_STRATEGY=latest \
+          cd /tmp/fixture && git add -A && git commit -qm applied || true
+          FACET_OUTPUT=/tmp/out2.txt FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
             bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
           grep -q '^updated=false' /tmp/out2.txt || { cat /tmp/out2.txt; exit 1; }
+
+  action:
+    name: action.yml wiring
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A fixture the action can point at, so this exercises action.yml's own
+      # input plumbing rather than only the script.
+      - name: Build a fixture
+        run: |
+          set -euo pipefail
+          mkdir -p fixture && cd fixture
+          printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
+          npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null
+
+      # dry-run proves the action resolves its inputs and runs the CLI without
+      # reaching the push or pull-request steps, so this needs no write token.
+      # Record the exact bytes first: the fixture is untracked, so a git-based
+      # check would pass without proving anything.
+      - name: Record fixture state
+        run: |
+          set -euo pipefail
+          sha256sum fixture/facets.json fixture/facets.lock > /tmp/fixture.sha
+
+      - name: Run the action in dry-run
+        id: dry
+        uses: ./
+        with:
+          working-directory: fixture
+          cli-version: ${{ env.FACET_CLI_PIN }}
+          strategy: latest
+          dry-run: 'true'
+
+      - name: Dry-run reports no change and writes nothing
+        env:
+          UPDATED: ${{ steps.dry.outputs.updated }}
+        run: |
+          set -euo pipefail
+          [ "$UPDATED" = "false" ] || { echo "dry-run reported updated=$UPDATED"; exit 1; }
+          sha256sum --check --status /tmp/fixture.sha \
+            || { echo "dry-run modified the fixture"; exit 1; }

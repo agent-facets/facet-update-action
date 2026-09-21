@@ -16,13 +16,20 @@ inputs:
     required: false
     default: latest
   cli-version:
-    description: Version of the agent-facets CLI to run, as an npm version or dist-tag.
+    description: |
+      Version of the agent-facets CLI to run, as an npm version or dist-tag.
+      Defaults to "latest", which executes whatever the registry serves at run
+      time. Pin an exact version for reproducible, reviewable runs.
     required: false
     default: latest
   working-directory:
     description: Directory containing facets.json.
     required: false
     default: .
+  dry-run:
+    description: Report what would change and stop. Nothing is committed, pushed, or opened.
+    required: false
+    default: 'false'
   open-pr:
     description: Open a pull request when facets change. Set false to leave the branch pushed and nothing else.
     required: false
@@ -44,20 +51,24 @@ inputs:
     required: false
     default: 'chore(facets): update facets'
   labels:
-    description: Comma-separated labels to apply to the pull request. Missing labels are skipped.
+    description: Comma-separated labels to apply to the pull request. A label that cannot be applied is logged and skipped.
     required: false
     default: ''
   token:
-    description: Token used to push the branch and open the pull request.
+    description: |
+      Token used for the pull request API calls (create, edit, label). It does
+      NOT authenticate the git push — that uses the credential actions/checkout
+      persisted. To push as a different identity, pass that token to
+      actions/checkout as well.
     required: false
     default: ${{ github.token }}
 
 outputs:
   updated:
-    description: '"true" when facets.json or facets.lock changed.'
+    description: '"true" when at least one facet changed version.'
     value: ${{ steps.update.outputs.updated }}
   count:
-    description: How many facets moved.
+    description: How many facets changed version.
     value: ${{ steps.update.outputs.count }}
   pr-url:
     description: URL of the pull request that was opened or updated, empty when none was.
@@ -73,6 +84,7 @@ runs:
         FACET_STRATEGY: ${{ inputs.strategy }}
         FACET_CLI_VERSION: ${{ inputs.cli-version }}
         FACET_WORKING_DIR: ${{ inputs.working-directory }}
+        FACET_DRY_RUN: ${{ inputs.dry-run }}
       run: |
         set -euo pipefail
         FACET_OUTPUT="$GITHUB_OUTPUT" bash "${GITHUB_ACTION_PATH}/scripts/facet-update.sh"
@@ -83,17 +95,40 @@ runs:
       shell: bash
       env:
         BRANCH: ${{ inputs.branch }}
+        BASE: ${{ inputs.base }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         COMMIT_MESSAGE: ${{ inputs.commit-message }}
         WORKING_DIR: ${{ inputs.working-directory }}
         SUMMARY_B64: ${{ steps.update.outputs.summary }}
-        GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
 
         # The branch name reaches git as an argument, so constrain it to
-        # something that cannot be read as a flag or a second token.
-        if ! printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$'; then
+        # something that cannot be read as a flag or a second token. Use
+        # bash's own [[ =~ ]] rather than grep: grep anchors per line, so a
+        # value containing a newline slips through a check that looks the same.
+        if [[ ! "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
           echo "facet-update: branch must match [A-Za-z0-9][A-Za-z0-9._/-]*, got '${BRANCH}'" >&2
+          exit 2
+        fi
+        if [ -n "$BASE" ] && [[ ! "$BASE" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+          echo "facet-update: base must match [A-Za-z0-9][A-Za-z0-9._/-]*, got '${BASE}'" >&2
+          exit 2
+        fi
+
+        # The whole point is to propose changes for review. Pushing the update
+        # straight onto the branch it would be reviewed against — or onto the
+        # default branch — defeats that, and on a repository without branch
+        # protection it lands unreviewed. Refuse rather than rely on the
+        # server to say no.
+        if [ -n "$BASE" ] && [ "$BRANCH" = "$BASE" ]; then
+          echo "facet-update: branch '${BRANCH}' is the branch this would open a pull request against." >&2
+          echo "  Choose a separate branch so the update can be reviewed." >&2
+          exit 2
+        fi
+        if [ -n "$DEFAULT_BRANCH" ] && [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
+          echo "facet-update: refusing to push updates directly onto the default branch '${DEFAULT_BRANCH}'." >&2
+          echo "  Set 'branch' to something else; the pull request is the point." >&2
           exit 2
         fi
 
@@ -101,10 +136,11 @@ runs:
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
         # actions/checkout only fetches the triggering ref, so the update
-        # branch is usually absent locally. Fetch it when it already exists so
-        # the push below has a lease baseline to compare against.
+        # branch is usually absent locally. Name the destination ref
+        # explicitly rather than relying on the remote's wildcard refspec to
+        # update it for us, so --force-with-lease below has a real baseline.
         HAVE_REMOTE=false
-        if git fetch --depth=1 origin "$BRANCH" 2>/dev/null; then
+        if git fetch --depth=1 origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
           HAVE_REMOTE=true
         fi
 
@@ -116,6 +152,15 @@ runs:
         # manifest that disagrees with what is on disk. Anything the project
         # ignores stays ignored.
         git add -A -- "$WORKING_DIR"
+
+        # A facet moved, but nothing is staged. The usual cause is facets.lock
+        # being gitignored, which leaves nothing to propose.
+        if git diff --cached --quiet; then
+          echo "facet-update: facets moved but nothing is staged for commit." >&2
+          echo "  Is facets.lock gitignored? It has to be tracked for an update to" >&2
+          echo "  be reviewable." >&2
+          exit 1
+        fi
 
         BODY="$(printf '%s' "$SUMMARY_B64" | base64 --decode)"
         printf '%s\n\n%s\n' "$COMMIT_MESSAGE" "$BODY" | git commit --file=-
@@ -151,22 +196,39 @@ runs:
         fi
 
         BODY="$(printf '%s\n\n%s\n\n%s\n' \
-          "${COUNT} facet(s) moved." \
+          "${COUNT} facet(s) changed." \
           "$SUMMARY" \
           "$NOTE")"
 
-        EXISTING="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+        # Scope the lookup by base as well as head: the same head branch can
+        # have separate open pull requests into different bases, and editing
+        # the wrong one would overwrite a pull request meant for another target.
+        LIST_ARGS=(--head "$BRANCH" --state open --json url --jq '.[0].url // empty')
+        [ -n "$BASE" ] && LIST_ARGS+=(--base "$BASE")
+        EXISTING="$(gh pr list "${LIST_ARGS[@]}")"
+
+        # `gh pr create` fails with a bare "Resource not accessible by
+        # integration" when the workflow forgot pull-requests: write. Say what
+        # to fix instead of leaving that in a log nobody reads.
+        explain_pr_failure() {
+          echo "facet-update: could not create or update the pull request." >&2
+          echo "  The branch was pushed, so the update is not lost." >&2
+          echo "  If this says 'Resource not accessible by integration', the workflow" >&2
+          echo "  is missing:  permissions:  pull-requests: write" >&2
+        }
 
         if [ -n "$EXISTING" ]; then
-          gh pr edit "$EXISTING" --title "$PR_TITLE" --body "$BODY"
+          gh pr edit "$EXISTING" --title "$PR_TITLE" --body "$BODY" || { explain_pr_failure; exit 1; }
           URL="$EXISTING"
         else
-          BASE_ARGS=()
-          [ -n "$BASE" ] && BASE_ARGS=(--base "$BASE")
-          URL="$(gh pr create --head "$BRANCH" "${BASE_ARGS[@]}" --title "$PR_TITLE" --body "$BODY")"
+          CREATE_ARGS=(--head "$BRANCH" --title "$PR_TITLE" --body "$BODY")
+          [ -n "$BASE" ] && CREATE_ARGS+=(--base "$BASE")
+          URL="$(gh pr create "${CREATE_ARGS[@]}")" || { explain_pr_failure; exit 1; }
         fi
 
-        # A label that does not exist in the repository must not fail the run.
+        # A label may fail for several reasons — it does not exist, or the token
+        # cannot manage labels. None of them are worth failing a run that has
+        # already produced a pull request, so log and carry on.
         if [ -n "$LABELS" ]; then
           IFS=',' read -ra PARSED <<< "$LABELS"
           for label in "${PARSED[@]}"; do

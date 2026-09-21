@@ -6,20 +6,31 @@ on:
     - cron: '0 6 * * 1' # 06:00 UTC every Monday
   workflow_dispatch:
 
+# Both are required. Without pull-requests: write the branch is pushed but the
+# pull request step fails.
 permissions:
   contents: write
   pull-requests: write
 
+# A delayed scheduled run can overlap a manual one; without this they race on
+# the same branch and the second push is rejected.
+concurrency:
+  group: facet-update-${{ github.ref }}
+
 jobs:
+  # Give this a job of its own. Any secret exposed to the job is visible to the
+  # CLI process this action runs.
   update:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: agent-facets/facet-update-action@v1
+      - uses: agent-facets/facet-update-action@main
         with:
           # "latest" proposes the newest release of every facet, rewriting
           # pinned entries. Use "in-range" to honour the ranges in facets.json
           # instead — but note an exactly-pinned entry then never moves.
           strategy: latest
+          # Pin this in production so a run executes a version you reviewed.
+          cli-version: latest
           labels: facets,dependencies
