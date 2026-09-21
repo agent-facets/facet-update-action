@@ -1,0 +1,25 @@
+# Copy this to .github/workflows/facet-update.yml in your own repository.
+name: Facet update
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # 06:00 UTC every Monday
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: agent-facets/facet-update-action@v1
+        with:
+          # "latest" proposes the newest release of every facet, rewriting
+          # pinned entries. Use "in-range" to honour the ranges in facets.json
+          # instead — but note an exactly-pinned entry then never moves.
+          strategy: latest
+          labels: facets,dependencies

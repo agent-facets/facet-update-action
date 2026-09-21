@@ -1,0 +1,162 @@
+name: Facet Update
+description: Keep a project's facets current on a schedule and open a pull request when any of them move.
+author: Agent Facets
+
+branding:
+  icon: refresh-cw
+  color: purple
+
+inputs:
+  strategy:
+    description: |
+      How far to move each facet. "latest" takes each facet's newest release,
+      rewriting pinned entries in facets.json. "in-range" only moves a facet
+      when a new release satisfies the range already written in facets.json,
+      which means an exactly-pinned entry never moves.
+    required: false
+    default: latest
+  cli-version:
+    description: Version of the agent-facets CLI to run, as an npm version or dist-tag.
+    required: false
+    default: latest
+  working-directory:
+    description: Directory containing facets.json.
+    required: false
+    default: .
+  open-pr:
+    description: Open a pull request when facets change. Set false to leave the branch pushed and nothing else.
+    required: false
+    default: 'true'
+  branch:
+    description: Branch to push the update onto. Reused and force-updated on later runs.
+    required: false
+    default: facet-updates
+  base:
+    description: Branch the pull request targets. Defaults to the repository's default branch.
+    required: false
+    default: ''
+  commit-message:
+    description: First line of the commit message.
+    required: false
+    default: 'chore(facets): update facets'
+  pr-title:
+    description: Title of the pull request.
+    required: false
+    default: 'chore(facets): update facets'
+  labels:
+    description: Comma-separated labels to apply to the pull request. Missing labels are skipped.
+    required: false
+    default: ''
+  token:
+    description: Token used to push the branch and open the pull request.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  updated:
+    description: '"true" when facets.json or facets.lock changed.'
+    value: ${{ steps.update.outputs.updated }}
+  count:
+    description: How many facets moved.
+    value: ${{ steps.update.outputs.count }}
+  pr-url:
+    description: URL of the pull request that was opened or updated, empty when none was.
+    value: ${{ steps.pr.outputs.pr-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run facet update
+      id: update
+      shell: bash
+      env:
+        FACET_STRATEGY: ${{ inputs.strategy }}
+        FACET_CLI_VERSION: ${{ inputs.cli-version }}
+        FACET_WORKING_DIR: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        FACET_OUTPUT="$GITHUB_OUTPUT" bash "${GITHUB_ACTION_PATH}/scripts/facet-update.sh"
+
+    - name: Commit and push
+      id: push
+      if: steps.update.outputs.updated == 'true'
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        WORKING_DIR: ${{ inputs.working-directory }}
+        SUMMARY_B64: ${{ steps.update.outputs.summary }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+
+        # The branch name reaches git as an argument, so constrain it to
+        # something that cannot be read as a flag or a second token.
+        if ! printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$'; then
+          echo "facet-update: branch must match [A-Za-z0-9][A-Za-z0-9._/-]*, got '${BRANCH}'" >&2
+          exit 2
+        fi
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        git checkout -B "$BRANCH"
+        git add -- "${WORKING_DIR}/facets.json" "${WORKING_DIR}/facets.lock"
+
+        BODY="$(printf '%s' "$SUMMARY_B64" | base64 --decode)"
+        printf '%s\n\n%s\n' "$COMMIT_MESSAGE" "$BODY" | git commit --file=-
+
+        git push --force-with-lease origin "$BRANCH"
+
+    - name: Open or update the pull request
+      id: pr
+      if: steps.update.outputs.updated == 'true' && inputs.open-pr == 'true'
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+        BASE: ${{ inputs.base }}
+        PR_TITLE: ${{ inputs.pr-title }}
+        LABELS: ${{ inputs.labels }}
+        STRATEGY: ${{ inputs.strategy }}
+        COUNT: ${{ steps.update.outputs.count }}
+        SUMMARY_B64: ${{ steps.update.outputs.summary }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+
+        SUMMARY="$(printf '%s' "$SUMMARY_B64" | base64 --decode)"
+
+        if [ "$STRATEGY" = "latest" ]; then
+          NOTE='Each facet was moved to its newest release, so a pinned entry in `facets.json` was rewritten. A facet you deliberately held to a major line may appear here; close this pull request to keep it where it is.'
+        else
+          NOTE='Only facets whose new release satisfies the range already in `facets.json` were moved. Exactly-pinned entries were left alone.'
+        fi
+
+        BODY="$(printf '%s\n\n%s\n\n%s\n' \
+          "${COUNT} facet(s) moved." \
+          "$SUMMARY" \
+          "$NOTE")"
+
+        EXISTING="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+
+        if [ -n "$EXISTING" ]; then
+          gh pr edit "$EXISTING" --title "$PR_TITLE" --body "$BODY"
+          URL="$EXISTING"
+        else
+          BASE_ARGS=()
+          [ -n "$BASE" ] && BASE_ARGS=(--base "$BASE")
+          URL="$(gh pr create --head "$BRANCH" "${BASE_ARGS[@]}" --title "$PR_TITLE" --body "$BODY")"
+        fi
+
+        # A label that does not exist in the repository must not fail the run.
+        if [ -n "$LABELS" ]; then
+          IFS=',' read -ra PARSED <<< "$LABELS"
+          for label in "${PARSED[@]}"; do
+            trimmed="$(printf '%s' "$label" | tr -d '[:space:]')"
+            [ -z "$trimmed" ] && continue
+            gh pr edit "$URL" --add-label "$trimmed" || echo "facet-update: label '${trimmed}' could not be applied, skipping"
+          done
+        fi
+
+        echo "pr-url=${URL}" >> "$GITHUB_OUTPUT"
+        echo "facet-update: $URL"

@@ -1,0 +1,51 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  script:
+    name: facet-update.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the script
+        run: shellcheck scripts/facet-update.sh
+
+      - name: Rejects an unknown strategy
+        run: |
+          set +e
+          FACET_STRATEGY=nonsense bash scripts/facet-update.sh
+          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
+
+      - name: Rejects an injected cli-version
+        run: |
+          set +e
+          FACET_CLI_VERSION='1.0.0 && echo pwned' bash scripts/facet-update.sh
+          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
+
+      - name: Detects a real update
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fixture && cd /tmp/fixture
+          git init -q . && git config user.email t@t && git config user.name t
+          printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
+          npx --yes agent-facets@latest install --accept-mcp < /dev/null
+          git add -A && git commit -qm init
+          FACET_OUTPUT=/tmp/out.txt FACET_STRATEGY=latest \
+            bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
+          grep -q '^updated=true' /tmp/out.txt || { cat /tmp/out.txt; exit 1; }
+
+      - name: Reports no change when everything is current
+        run: |
+          set -euo pipefail
+          cd /tmp/fixture && git add -A && git commit -qm applied
+          FACET_OUTPUT=/tmp/out2.txt FACET_STRATEGY=latest \
+            bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
+          grep -q '^updated=false' /tmp/out2.txt || { cat /tmp/out2.txt; exit 1; }
