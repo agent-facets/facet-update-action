@@ -100,13 +100,31 @@ runs:
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+        # actions/checkout only fetches the triggering ref, so the update
+        # branch is usually absent locally. Fetch it when it already exists so
+        # the push below has a lease baseline to compare against.
+        HAVE_REMOTE=false
+        if git fetch --depth=1 origin "$BRANCH" 2>/dev/null; then
+          HAVE_REMOTE=true
+        fi
+
         git checkout -B "$BRANCH"
-        git add -- "${WORKING_DIR}/facets.json" "${WORKING_DIR}/facets.lock"
+
+        # Updating rewrites facets.json and facets.lock, and also re-materializes
+        # each facet's assets into the adapter directories. Projects that track
+        # those assets need them in the same commit, or the pull request lands a
+        # manifest that disagrees with what is on disk. Anything the project
+        # ignores stays ignored.
+        git add -A -- "$WORKING_DIR"
 
         BODY="$(printf '%s' "$SUMMARY_B64" | base64 --decode)"
         printf '%s\n\n%s\n' "$COMMIT_MESSAGE" "$BODY" | git commit --file=-
 
-        git push --force-with-lease origin "$BRANCH"
+        if [ "$HAVE_REMOTE" = true ]; then
+          git push --force-with-lease origin "$BRANCH"
+        else
+          git push origin "$BRANCH"
+        fi
 
     - name: Open or update the pull request
       id: pr
