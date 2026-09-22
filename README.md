@@ -50,8 +50,13 @@ week.
 
 `facets.lock` must be committed. `facet update` refuses to run when a facet in
 `facets.json` has no lockfile entry, so run `facet install` and commit both
-files before scheduling updates. If `facets.lock` is gitignored the action will
-tell you and stop, because an update it cannot commit is not reviewable.
+files before scheduling updates.
+
+`facets.lock` must also be **tracked by git**. If it is gitignored or was never
+committed, the action stops rather than opening a pull request: updating also
+rewrites `facets.json` and re-materializes assets, so a run with an ignored
+lockfile would otherwise produce a perfectly plausible pull request whose
+manifest claims versions the lockfile never recorded.
 
 ## Choosing a schedule
 
@@ -107,7 +112,7 @@ ranges are deliberate and you would rather be told nothing than told wrong.
 | `working-directory` | `.` | Directory holding `facets.json`. |
 | `dry-run` | `false` | Report what would change and stop. Nothing is committed, pushed, or opened. |
 | `open-pr` | `true` | Set `false` to push the branch and stop there. |
-| `branch` | `facet-updates` | Branch the update is pushed to; reused across runs. Cannot equal the base branch. |
+| `branch` | `facet-updates` | Branch the update is pushed to; reused and force-updated across runs. Cannot equal the base or default branch, and the action refuses it if someone else wrote its latest commit. |
 | `base` | repo default | Branch the pull request targets. |
 | `commit-message` | `chore(facets): update facets` | First line of the commit. |
 | `pr-title` | `chore(facets): update facets` | Pull request title. |
@@ -118,9 +123,20 @@ ranges are deliberate and you would rather be told nothing than told wrong.
 
 | Output | What it is |
 | --- | --- |
-| `updated` | `"true"` when at least one facet changed version. |
-| `count` | How many facets changed version. |
+| `updated` | `"true"` when at least one facet entry in `facets.lock` changed. Always `"false"` on a dry run. |
+| `count` | How many facet entries changed — upgrades, downgrades, additions and removals, not just version bumps. A dry run reports the real count with `updated` still `"false"`. |
 | `pr-url` | URL of the pull request, empty when none was opened. |
+
+## The update branch
+
+The action force-updates `branch` on every run, so it has to own that branch. Before
+pushing it checks who wrote the branch's latest commit; if it was anyone other than
+`github-actions[bot]`, the run stops rather than replacing someone's work.
+`--force-with-lease` alone would not save you here — the lease is taken against the tip
+the action just fetched, so it matches.
+
+Point `branch` at a name reserved for this action. It also refuses to push onto the base
+branch or the repository default branch.
 
 ## Permissions
 

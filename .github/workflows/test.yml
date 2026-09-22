@@ -46,6 +46,12 @@ jobs:
           [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
           [ ! -f /tmp/pwned ] || { echo "payload executed"; exit 1; }
 
+      - name: Rejects a dry-run value that is not true or false
+        run: |
+          set +e
+          FACET_DRY_RUN=True bash scripts/facet-update.sh
+          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
+
       - name: Refuses to run without a lockfile
         run: |
           set +e
@@ -85,6 +91,17 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
           grep -q '^updated=true' /tmp/out-ignored.txt || { cat /tmp/out-ignored.txt; exit 1; }
 
+      # A lockfile we cannot parse must be an error, not an empty lockfile:
+      # treating it as empty makes every facet look newly added.
+      - name: Refuses a malformed lockfile
+        run: |
+          set +e
+          mkdir -p /tmp/badlock && cd /tmp/badlock
+          printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
+          printf 'not json\n' > facets.lock
+          FACET_WORKING_DIR=/tmp/badlock bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
+          [ $? -ne 0 ] || { echo "expected a non-zero exit"; exit 1; }
+
       - name: Reports no change when everything is current
         run: |
           set -euo pipefail
@@ -93,6 +110,10 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
           grep -q '^updated=false' /tmp/out2.txt || { cat /tmp/out2.txt; exit 1; }
 
+  # NOT covered here: the push step's two refusals — an untracked facets.lock,
+  # and a branch whose latest commit is someone else's. Both live inside
+  # action.yml's `run:` block and need a writable remote to exercise, which the
+  # dry-run job deliberately does not have. They are reviewed, not tested.
   action:
     name: action.yml wiring
     runs-on: ubuntu-latest

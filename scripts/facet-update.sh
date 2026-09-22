@@ -53,6 +53,18 @@ if [[ ! "$CLI_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   exit 2
 fi
 
+# Anything that is not exactly "false" here has to be rejected rather than
+# treated as false. A workflow that says dry-run: True means "preview", and
+# silently giving it a real update — commit, push, pull request — is the one
+# failure this input exists to prevent.
+case "$DRY_RUN" in
+  true | false) ;;
+  *)
+    echo "facet-update: dry-run must be 'true' or 'false', got '${DRY_RUN}'" >&2
+    exit 2
+    ;;
+esac
+
 if [ ! -d "$WORKING_DIR" ]; then
   echo "facet-update: working directory '${WORKING_DIR}' does not exist" >&2
   exit 2
@@ -78,6 +90,7 @@ fi
 # Record the locked versions before we touch anything, so the summary can say
 # what moved rather than just that something did.
 snapshot() {
+  # shellcheck disable=SC2016  # ${...} below is a JS template literal, not shell
   node -e '
     const fs = require("fs")
     if (!fs.existsSync("facets.lock")) { console.log("{}"); process.exit(0) }
@@ -86,8 +99,11 @@ snapshot() {
       const out = {}
       for (const [name, entry] of Object.entries(lock.facets ?? {})) out[name] = entry.version
       console.log(JSON.stringify(out))
-    } catch {
-      console.log("{}")
+    } catch (err) {
+      // Swallowing this would make a corrupt lockfile read as an empty one,
+      // and every facet would then look newly added.
+      process.stderr.write(`facet-update: facets.lock is not valid JSON (${err.message})\n`)
+      process.exit(1)
     }
   '
 }

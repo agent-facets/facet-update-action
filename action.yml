@@ -132,8 +132,9 @@ runs:
           exit 2
         fi
 
+        BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
         git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config user.email "$BOT_EMAIL"
 
         # actions/checkout only fetches the triggering ref, so the update
         # branch is usually absent locally. Name the destination ref
@@ -142,6 +143,23 @@ runs:
         HAVE_REMOTE=false
         if git fetch --depth=1 origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
           HAVE_REMOTE=true
+        fi
+
+        # This branch gets force-replaced on every run, so the action has to
+        # own it. If it already exists and someone else wrote its tip, that is
+        # a human's branch and force-pushing would delete their work — and
+        # --force-with-lease would not stop it, because the lease was taken
+        # against the tip we just fetched. Every commit this action makes is
+        # authored by BOT_EMAIL, so authorship is an exact ownership test.
+        if [ "$HAVE_REMOTE" = true ]; then
+          TIP_AUTHOR="$(git log -1 --format='%ae' "refs/remotes/origin/${BRANCH}")"
+          if [ "$TIP_AUTHOR" != "$BOT_EMAIL" ]; then
+            echo "facet-update: refusing to force-push over branch '${BRANCH}'." >&2
+            echo "  Its latest commit is by '${TIP_AUTHOR}', not this action, so it is" >&2
+            echo "  someone's work and this run would replace it." >&2
+            echo "  Set 'branch' to a name this action can own, or delete that branch." >&2
+            exit 2
+          fi
         fi
 
         git checkout -B "$BRANCH"
@@ -153,12 +171,27 @@ runs:
         # ignores stays ignored.
         git add -A -- "$WORKING_DIR"
 
-        # A facet moved, but nothing is staged. The usual cause is facets.lock
-        # being gitignored, which leaves nothing to propose.
+        # The lockfile is the only file that records what is actually
+        # installed, so a commit without it is not a reviewable update.
+        #
+        # Checking "did anything get staged" does not catch this: updating
+        # also rewrites facets.json and re-materializes assets, so a run whose
+        # facets.lock is gitignored still stages plenty and sails past that
+        # check — then opens a pull request whose manifest claims versions the
+        # lockfile never recorded. Ask about the lockfile directly instead.
+        # Tracked is the exact question: git stages a tracked file even when
+        # .gitignore also names it, and never stages one that is untracked.
+        LOCKFILE="${WORKING_DIR%/}/facets.lock"
+        if ! git ls-files --error-unmatch -- "$LOCKFILE" > /dev/null 2>&1; then
+          echo "facet-update: '${LOCKFILE}' is not tracked by git, so this update" >&2
+          echo "  cannot be committed or reviewed." >&2
+          echo "  Remove it from .gitignore, then 'git add ${LOCKFILE}' and commit it." >&2
+          exit 1
+        fi
+
+        # Belt and braces: a facet moved, so something must be staged.
         if git diff --cached --quiet; then
           echo "facet-update: facets moved but nothing is staged for commit." >&2
-          echo "  Is facets.lock gitignored? It has to be tracked for an update to" >&2
-          echo "  be reviewable." >&2
           exit 1
         fi
 
