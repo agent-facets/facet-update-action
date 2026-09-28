@@ -1,6 +1,7 @@
 name: Test
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -16,109 +17,108 @@ env:
   FACET_CLI_PIN: '0.33.1'
 
 jobs:
-  script:
-    name: facet-update.sh
+  shell-suites:
+    name: Shell gates and hermetic suites
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Lint the script
-        run: shellcheck scripts/facet-update.sh
-
-      - name: Rejects an unknown strategy
-        run: |
-          set +e
-          FACET_STRATEGY=nonsense bash scripts/facet-update.sh
-          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
-
-      - name: Rejects an injected cli-version
-        run: |
-          set +e
-          FACET_CLI_VERSION='1.0.0 && echo pwned' bash scripts/facet-update.sh
-          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
-
-      # grep anchors per line, so this payload passes a grep-based check. The
-      # script uses [[ =~ ]] precisely so it does not.
-      - name: Rejects a multi-line cli-version
-        run: |
-          set +e
-          FACET_CLI_VERSION=$'1.0.0\n; touch /tmp/pwned' bash scripts/facet-update.sh
-          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
-          [ ! -f /tmp/pwned ] || { echo "payload executed"; exit 1; }
-
-      - name: Rejects a dry-run value that is not true or false
-        run: |
-          set +e
-          FACET_DRY_RUN=True bash scripts/facet-update.sh
-          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
-
-      - name: Refuses to run without a lockfile
-        run: |
-          set +e
-          mkdir -p /tmp/nolock && cd /tmp/nolock
-          printf '{ "facets": {}, "manifestVersion": 0.1 }\n' > facets.json
-          FACET_WORKING_DIR=/tmp/nolock bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
-          [ $? -eq 2 ] || { echo "expected exit 2"; exit 1; }
-
-      - name: Detects a real update
+      - name: Run ShellCheck and Bash syntax gates
         run: |
           set -euo pipefail
-          mkdir -p /tmp/fixture && cd /tmp/fixture
-          git init -q . && git config user.email t@t && git config user.name t
+          mapfile -t shell_scripts < <(printf '%s\n' scripts/*.sh | LC_ALL=C sort)
+          shellcheck "${shell_scripts[@]}"
+          for shell_script in "${shell_scripts[@]}"; do
+            bash -n "$shell_script"
+          done
+
+      - name: Run every shell test suite in sorted order
+        run: |
+          set -euo pipefail
+          mapfile -t test_scripts < <(printf '%s\n' scripts/*.test.sh | LC_ALL=C sort)
+          for test_script in "${test_scripts[@]}"; do
+            echo "::group::$test_script"
+            bash "$test_script"
+            echo '::endgroup::'
+          done
+
+  published-cli:
+    name: Published agent-facets 0.33.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install with the published CLI
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/published-cli && cd /tmp/published-cli
+          git init -q .
+          git config user.email t@t
+          git config user.name t
           printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
           npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null
-          git add -A && git commit -qm init
-          FACET_OUTPUT=/tmp/out.txt FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
-            bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
-          grep -q '^updated=true' /tmp/out.txt || { cat /tmp/out.txt; exit 1; }
+          test -f facets.lock
+          git add -A
+          git commit -qm installed
 
-      # Detection must not depend on git seeing the lockfile: this is the
-      # regression that shipped updated=false while a facet had actually moved.
-      - name: Detects an update whose lockfile is gitignored
+      - name: Apply a real update
         run: |
           set -euo pipefail
-          cd /tmp/fixture
-          printf 'facets.lock\n' > .gitignore
-          git rm -q --cached facets.lock
-          git add -A && git commit -qm ignore-lock
+          cd /tmp/published-cli
           node -e '
             const fs = require("fs")
             const lock = JSON.parse(fs.readFileSync("facets.lock", "utf8"))
-            for (const e of Object.values(lock.facets)) e.version = "1.0.0"
+            for (const entry of Object.values(lock.facets)) entry.version = "1.0.0"
             fs.writeFileSync("facets.lock", JSON.stringify(lock, null, 2) + "\n")
           '
-          FACET_OUTPUT=/tmp/out-ignored.txt FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
+          FACET_OUTPUT=/tmp/update.out FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
             bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
-          grep -q '^updated=true' /tmp/out-ignored.txt || { cat /tmp/out-ignored.txt; exit 1; }
+          grep -Fxq 'updated=true' /tmp/update.out
+          grep -Fxq 'count=1' /tmp/update.out
+          git add -A
+          git commit -qm updated
 
-      # A lockfile we cannot parse must be an error, not an empty lockfile:
-      # treating it as empty makes every facet look newly added.
-      - name: Refuses a malformed lockfile
-        run: |
-          set +e
-          mkdir -p /tmp/badlock && cd /tmp/badlock
-          printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
-          printf 'not json\n' > facets.lock
-          FACET_WORKING_DIR=/tmp/badlock bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
-          [ $? -ne 0 ] || { echo "expected a non-zero exit"; exit 1; }
-
-      - name: Reports no change when everything is current
+      - name: Report a no-op when current
         run: |
           set -euo pipefail
-          cd /tmp/fixture && git add -A && git commit -qm applied || true
-          FACET_OUTPUT=/tmp/out2.txt FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
+          cd /tmp/published-cli
+          FACET_OUTPUT=/tmp/no-op.out FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
             bash "$GITHUB_WORKSPACE/scripts/facet-update.sh"
-          grep -q '^updated=false' /tmp/out2.txt || { cat /tmp/out2.txt; exit 1; }
+          printf 'updated=false\ncount=0\nsummary=\n' > /tmp/no-op.expected
+          cmp /tmp/no-op.expected /tmp/no-op.out
 
-  # NOT covered here: the push step's two refusals — an untracked facets.lock,
-  # and a branch whose latest commit is someone else's. Both live inside
-  # action.yml's `run:` block and need a writable remote to exercise, which the
-  # dry-run job deliberately does not have. They are reviewed, not tested.
+      - name: Preserve bytes during dry-run
+        run: |
+          set -euo pipefail
+          cd /tmp/published-cli
+          node -e '
+            const fs = require("fs")
+            const lock = JSON.parse(fs.readFileSync("facets.lock", "utf8"))
+            for (const entry of Object.values(lock.facets)) entry.version = "1.0.0"
+            fs.writeFileSync("facets.lock", JSON.stringify(lock, null, 2) + "\n")
+          '
+          sha256sum facets.json facets.lock > /tmp/published-cli.sha
+          if ! dry_run_log=$(FACET_DRY_RUN=true FACET_OUTPUT=/tmp/dry-run.out \
+            FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
+            bash "$GITHUB_WORKSPACE/scripts/facet-update.sh" 2>&1); then
+            printf '%s\n' "$dry_run_log"
+            exit 1
+          fi
+          printf '%s\n' "$dry_run_log"
+          grep -Fxq 'facet-update: updated=false count=0' <<< "$dry_run_log"
+          printf 'updated=false\ncount=0\nsummary=\n' > /tmp/dry-run.expected
+          cmp /tmp/dry-run.expected /tmp/dry-run.out
+          sha256sum --check --status /tmp/published-cli.sha
+
   action:
     name: action.yml wiring
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Assert the CLI input default is pinned
+        run: |
+          ruby -e "require 'yaml'; action = YAML.load_file('action.yml'); abort 'cli-version default is not pinned' unless action.fetch('inputs').fetch('cli-version').fetch('default') == ENV.fetch('FACET_CLI_PIN')"
 
       # A fixture the action can point at, so this exercises action.yml's own
       # input plumbing rather than only the script.
@@ -143,15 +143,18 @@ jobs:
         uses: ./
         with:
           working-directory: fixture
-          cli-version: ${{ env.FACET_CLI_PIN }}
           strategy: latest
           dry-run: 'true'
 
       - name: Dry-run reports no change and writes nothing
         env:
           UPDATED: ${{ steps.dry.outputs.updated }}
+          COUNT: ${{ steps.dry.outputs.count }}
+          SUMMARY: ${{ steps.dry.outputs.summary }}
         run: |
           set -euo pipefail
           [ "$UPDATED" = "false" ] || { echo "dry-run reported updated=$UPDATED"; exit 1; }
+          [ "$COUNT" = "0" ] || { echo "dry-run reported count=$COUNT"; exit 1; }
+          [ -z "$SUMMARY" ] || { echo "dry-run reported summary=$SUMMARY"; exit 1; }
           sha256sum --check --status /tmp/fixture.sha \
             || { echo "dry-run modified the fixture"; exit 1; }
