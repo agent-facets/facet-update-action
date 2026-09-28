@@ -31,6 +31,7 @@ assert_contains() {
 cat > "$FAKE_BIN/npx" <<'FAKE_NPX'
 #!/usr/bin/env bash
 set -euo pipefail
+[ -z "${SENTINEL_DIR:-}" ] || : > "$SENTINEL_DIR/npx"
 case "${FAKE_NPX_MODE:-change}" in
   fail) exit 19 ;;
   no-change) exit 0 ;;
@@ -52,6 +53,8 @@ FAKE_NPX
 cat > "$FAKE_BIN/gh" <<'FAKE_GH'
 #!/usr/bin/env bash
 set -euo pipefail
+gh_args=("$@")
+[ -z "${SENTINEL_DIR:-}" ] || : > "$SENTINEL_DIR/gh"
 printf '%s\n' "$*" >> "${FAKE_GH_LOG:?}"
 if [ "${1:-}" = api ]; then
   method=GET
@@ -64,6 +67,23 @@ if [ "${1:-}" = api ]; then
   done
   case "$method" in
     GET)
+      expected=(
+        api --method GET "/repos/${GITHUB_REPOSITORY}/pulls"
+        -f state=all
+        -f "head=${GITHUB_REPOSITORY_OWNER}:${FAKE_EXPECT_BRANCH}"
+        -f "base=${FAKE_EXPECT_BASE}"
+        -F per_page=100 --paginate --slurp
+      )
+      [ "${#gh_args[@]}" = "${#expected[@]}" ] || {
+        echo "fake-gh: GET argv length ${#gh_args[@]} != ${#expected[@]}" >&2
+        exit 47
+      }
+      for index in "${!expected[@]}"; do
+        [ "${gh_args[$index]}" = "${expected[$index]}" ] || {
+          echo "fake-gh: GET argv[$index] '${gh_args[$index]}' != '${expected[$index]}'" >&2
+          exit 47
+        }
+      done
       if [ -n "${FAKE_GH_HOOK:-}" ] && [ ! -e "${FAKE_GH_HOOK_DONE:-/dev/null}" ]; then
         : > "$FAKE_GH_HOOK_DONE"
         "$FAKE_GH_HOOK"
@@ -111,10 +131,19 @@ if [ "${1:-}" = push ] && [ -n "${BARRIER_N:-}" ]; then
   while [ ! -e "$BARRIER_DIR/release" ]; do sleep 0.02; done
   printf '%s ' "${git_args[@]}" > "$BARRIER_DIR/push.$$"
 fi
+if [ "${1:-}" = push ] && [ -n "${SENTINEL_DIR:-}" ]; then
+  : > "$SENTINEL_DIR/push"
+fi
 exec "${REAL_GIT:?}" "${git_args[@]}"
 FAKE_GIT
 
-chmod +x "$FAKE_BIN/npx" "$FAKE_BIN/gh" "$FAKE_BIN/git"
+cat > "$FAKE_BIN/run-publish" <<'RUN_PUBLISH'
+#!/usr/bin/env bash
+set -euo pipefail
+exec bash "${PUBLISH_SCRIPT:?}"
+RUN_PUBLISH
+
+chmod +x "$FAKE_BIN/npx" "$FAKE_BIN/gh" "$FAKE_BIN/git" "$FAKE_BIN/run-publish"
 
 write_project() {
   local root="$1"
@@ -209,10 +238,13 @@ run_publish() {
       GITHUB_REPOSITORY_OWNER=acme \
       FAKE_PR_LIST="$FIXTURE/pr-list.json" \
       FAKE_GH_LOG="$FIXTURE/gh.log" \
+      FAKE_EXPECT_BRANCH=facet-updates \
+      FAKE_EXPECT_BASE=main \
       FAKE_CREATE_AUTHOR='github-actions[bot]' \
       FAKE_VALUE="$value" \
+      PUBLISH_SCRIPT="$clone/scripts/publish-update.sh" \
       "$@" \
-      bash "$clone/scripts/publish-update.sh"
+      run-publish
   )
 }
 
@@ -334,30 +366,163 @@ expect_rejected() {
   pass "$label refuses without a push"
 }
 
-new_fixture legacy-red
-legacy="$(fresh_clone legacy)"
+DELIVERED_WRAPPER_BLOB="$("$REAL_GIT" hash-object "$SCRIPT_DIR/publish-update.sh")"
+
+make_mutant() {
+  local kind="$1"
+  local mutant_dir="$FIXTURE/mutant-$kind"
+  mkdir -p "$mutant_dir"
+  cp "$SCRIPT_DIR/facet-update.sh" "$SCRIPT_DIR/publish-update.sh" "$mutant_dir/"
+  node - "$mutant_dir/publish-update.sh" "$kind" <<'NODE'
+const fs = require('fs')
+const [file, kind] = process.argv.slice(2)
+const original = fs.readFileSync(file, 'utf8')
+let mutant = original
+if (kind === 'wrong-parent') {
+  mutant = mutant.replace(
+    'git checkout -B "$BRANCH" "$BASE_SHA"',
+    'git checkout -B "$BRANCH" # MUTATION: recreate from triggering ref'
+  )
+} else if (kind === 'dirty-tree') {
+  mutant = mutant.replace(
+    '[ -z "$(git status --porcelain=v1 --untracked-files=all)" ] || fail \'caller repository must be completely clean\'',
+    ': # MUTATION: permit dirty caller state'
+  )
+} else if (kind === 'email-only') {
+  mutant = mutant.split('\n').map(line =>
+    line.includes('trailers:key=${GENERATED_KEY}') || line.includes('trailers:key=${AUTHOR_KEY}')
+      ? '  : # MUTATION: admit bot email without structural trailers'
+      : line
+  ).join('\n')
+} else {
+  throw new Error('unknown mutation ' + kind)
+}
+if (mutant === original) throw new Error('mutation did not alter executable source: ' + kind)
+fs.writeFileSync(file, mutant)
+NODE
+  printf '%s\n' "$mutant_dir/publish-update.sh"
+}
+
+new_fixture mutation-wrong-parent
+clone="$(fresh_clone caller)"
 (
-  cd "$legacy"
+  cd "$clone"
   "$REAL_GIT" checkout -q -b feature
   printf 'feature\n' > feature.txt
   "$REAL_GIT" add feature.txt
   "$REAL_GIT" commit -q -m feature
-  feature_tip="$("$REAL_GIT" rev-parse HEAD)"
-  "$REAL_GIT" checkout -q -B legacy-update
-  printf 'legacy\n' > project/agents/demo.md
-  printf 'dirty\n' > accidental.txt
-  "$REAL_GIT" add -A -- .
-  "$REAL_GIT" commit -q -m legacy
-  [ "$("$REAL_GIT" rev-parse HEAD^)" = "$feature_tip" ] || exit 1
-  "$REAL_GIT" show --name-only --format= HEAD | grep -Fx accidental.txt >/dev/null
-  "$REAL_GIT" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-  printf 'email only\n' > project/agents/demo.md
-  "$REAL_GIT" add project
-  "$REAL_GIT" commit -q -m email-only
-  [ "$("$REAL_GIT" log -1 --format=%ae)" = '41898282+github-actions[bot]@users.noreply.github.com' ]
-  [ -z "$("$REAL_GIT" show -s --format='%(trailers:key=Facet-Update-Generated,valueonly)' HEAD)" ]
-) || fail_test 'legacy defect reproduction did not turn red'
-pass 'old inline behavior reproduces wrong parent, dirty inclusion, and email-only admission'
+)
+mutant="$(make_mutant wrong-parent)"
+set +e
+run_publish "$clone" 1 PUBLISH_SCRIPT="$mutant" > "$FIXTURE/mutant-run.log" 2>&1
+probe_status=$?
+set -e
+[ "$probe_status" != 0 ] || fail_test 'wrong-parent mutant was not killed'
+assert_contains "$FIXTURE/mutant-run.log" 'facet-update: generated tip parent is not the resolved base' 'wrong-parent mutation output'
+echo "RED ASSERTION wrong-parent: delivered parent check exited $probe_status"
+pass "MUTATION PROBE — REVERTED: wrong-parent mutant produced nonzero assertion status $probe_status"
+
+new_fixture mutation-dirty-tree
+clone="$(fresh_clone caller)"
+printf 'do not include\n' > "$clone/project/accidental.txt"
+mutant="$(make_mutant dirty-tree)"
+set +e
+(
+  run_publish "$clone" 1 PUBLISH_SCRIPT="$mutant" > "$FIXTURE/mutant-run.log" 2>&1 || exit 90
+  if "$REAL_GIT" --git-dir="$REMOTE" show --name-only --format= refs/heads/facet-updates | grep -Fx project/accidental.txt >/dev/null; then
+    echo 'RED ASSERTION dirty-tree: accidental caller file entered generated commit'
+    exit 92
+  fi
+) > "$FIXTURE/probe.log" 2>&1
+probe_status=$?
+set -e
+[ "$probe_status" = 92 ] || fail_test "dirty-tree mutant was not killed (status $probe_status)"
+assert_contains "$FIXTURE/probe.log" 'RED ASSERTION dirty-tree:' 'dirty-tree mutation output'
+cat "$FIXTURE/probe.log"
+pass "MUTATION PROBE — REVERTED: dirty-tree mutant produced nonzero assertion status $probe_status"
+
+new_fixture mutation-email-only
+tip="$(make_tip email-only)"
+valid_record "$FIXTURE/pr-list.json" open "$tip"
+clone="$(fresh_clone caller)"
+mutant="$(make_mutant email-only)"
+set +e
+(
+  if run_publish "$clone" 2 PUBLISH_SCRIPT="$mutant" > "$FIXTURE/mutant-run.log" 2>&1; then
+    echo 'RED ASSERTION email-only: bot email without structural trailers was admitted'
+    exit 93
+  fi
+) > "$FIXTURE/probe.log" 2>&1
+probe_status=$?
+set -e
+[ "$probe_status" = 93 ] || fail_test "email-only mutant was not killed (status $probe_status)"
+assert_contains "$FIXTURE/probe.log" 'RED ASSERTION email-only:' 'email-only mutation output'
+assert_eq "$("$REAL_GIT" hash-object "$SCRIPT_DIR/publish-update.sh")" "$DELIVERED_WRAPPER_BLOB" 'delivered wrapper changed during mutation probes'
+cat "$FIXTURE/probe.log"
+pass "MUTATION PROBE — REVERTED: email-only mutant produced nonzero assertion status $probe_status and delivered source stayed restored"
+
+expect_input_rejected() {
+  local slug="$1"
+  local label="$2"
+  shift 2
+  new_fixture "input-$slug"
+  local clone
+  clone="$(fresh_clone caller)"
+  local sentinel="$FIXTURE/sentinel"
+  mkdir -p "$sentinel"
+  if run_publish "$clone" 1 SENTINEL_DIR="$sentinel" "$@" > "$FIXTURE/input.log" 2>&1; then
+    fail_test "$label unexpectedly succeeded"
+  fi
+  [ -z "$(ls -A "$sentinel")" ] || fail_test "$label reached CLI, API, push, or injected command"
+  if "$REAL_GIT" --git-dir="$REMOTE" show-ref --verify --quiet refs/heads/facet-updates; then
+    fail_test "$label pushed"
+  fi
+  pass "input rejection before CLI/API/push: $label"
+}
+
+expect_input_rejected option-branch 'option-like branch' BRANCH=-danger
+expect_input_rejected option-base 'option-like base' BASE=-danger
+expect_input_rejected newline-branch 'newline branch' BRANCH=$'bad\nmain'
+expect_input_rejected newline-base 'newline base' BASE=$'bad\nmain'
+expect_input_rejected traversal 'working-directory traversal' FACET_WORKING_DIR=project/../project
+
+new_fixture input-symlink
+clone="$(fresh_clone caller)"
+ln -s project "$clone/project-link"
+sentinel="$FIXTURE/sentinel"
+mkdir -p "$sentinel"
+if run_publish "$clone" 1 SENTINEL_DIR="$sentinel" FACET_WORKING_DIR=project-link > "$FIXTURE/input.log" 2>&1; then
+  fail_test 'symlink working directory unexpectedly succeeded'
+fi
+[ -z "$(ls -A "$sentinel")" ] || fail_test 'symlink working directory reached CLI, API, or push'
+pass 'input rejection before CLI/API/push: symlink working directory'
+
+expect_input_rejected dry-run-boolean 'malformed dry-run boolean' FACET_DRY_RUN=True
+expect_input_rejected open-pr-boolean 'malformed open-pr boolean' OPEN_PR=yes
+expect_input_rejected cli-version 'malformed/injecting CLI version' "FACET_CLI_VERSION=0.33.1;touch $TEST_ROOT/injected"
+expect_input_rejected repository 'malformed/injecting repository' "GITHUB_REPOSITORY=acme/widgets;touch $TEST_ROOT/injected"
+expect_input_rejected owner 'repository/owner mismatch' GITHUB_REPOSITORY_OWNER=other
+expect_input_rejected pr-author 'malformed/injecting pr-author' "PR_AUTHOR=bot\$(touch $TEST_ROOT/injected)"
+[ ! -e "$TEST_ROOT/injected" ] || fail_test 'input payload executed a sentinel command'
+pass 'all injection payload sentinel commands remained unexecuted'
+
+new_fixture gh-argv-mechanism
+if env \
+  PATH="$FAKE_BIN:$PATH" \
+  FAKE_GH_LOG="$FIXTURE/gh.log" \
+  FAKE_PR_LIST="$FIXTURE/pr-list.json" \
+  GITHUB_REPOSITORY=acme/widgets \
+  GITHUB_REPOSITORY_OWNER=acme \
+  FAKE_EXPECT_BRANCH=facet-updates \
+  FAKE_EXPECT_BASE=main \
+  gh api --method GET /repos/acme/widgets/pulls \
+    -f state=all -f head=acme:facet-updates -f base=main \
+    -F per_page=100 --paginate > "$FIXTURE/mechanism.log" 2>&1; then
+  fail_test 'fake gh accepted GET without --slurp'
+fi
+assert_contains "$FIXTURE/mechanism.log" 'fake-gh: GET argv length' 'negative REST argv mechanism probe'
+cat "$FIXTURE/mechanism.log"
+pass 'negative mechanism probe turns red when exact REST pagination argv is incomplete'
 
 for dirty_kind in staged modified untracked untracked-lock; do
   new_fixture "dirty-$dirty_kind"

@@ -45,6 +45,17 @@ git check-ref-format --branch "$EFFECTIVE_BASE" >/dev/null 2>&1 || fail "invalid
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || fail 'not inside a git repository'
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
+[ "$WORKING_DIR" = '.' ] || {
+  [[ "$WORKING_DIR" != /* ]] || fail "working directory '${WORKING_DIR}' must be repository-relative"
+  [[ "$WORKING_DIR" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || fail "working directory '${WORKING_DIR}' must be normalized without traversal"
+  path_cursor='.'
+  IFS='/' read -r -a path_segments <<< "$WORKING_DIR"
+  for path_segment in "${path_segments[@]}"; do
+    case "$path_segment" in . | ..) fail "working directory '${WORKING_DIR}' must be normalized without traversal" ;; esac
+    path_cursor="${path_cursor}/${path_segment}"
+    [ ! -L "$path_cursor" ] || fail "working directory '${WORKING_DIR}' must not traverse symlinks"
+  done
+}
 [ -d "$WORKING_DIR" ] || fail "working directory '${WORKING_DIR}' does not exist"
 WORKING_ABS="$(cd "$WORKING_DIR" && pwd -P)"
 case "$WORKING_ABS/" in "$REPO_ROOT/"*) ;; *) fail "working directory '${WORKING_DIR}' is outside the repository" ;; esac
