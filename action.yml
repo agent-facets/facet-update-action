@@ -8,76 +8,69 @@ branding:
 
 inputs:
   strategy:
-    description: |
-      How far to move each facet. "latest" takes each facet's newest release,
-      rewriting pinned entries in facets.json. "in-range" only moves a facet
-      when a new release satisfies the range already written in facets.json,
-      which means an exactly-pinned entry never moves.
+    description: How far to move each facet, latest or in-range.
     required: false
     default: latest
   cli-version:
-    description: |
-      Version of the agent-facets CLI to run, as an npm version or dist-tag.
-      Defaults to "latest", which executes whatever the registry serves at run
-      time. Pin an exact version for reproducible, reviewable runs.
+    description: Version of the agent-facets CLI to run.
     required: false
-    default: latest
+    default: 0.33.1
   working-directory:
     description: Directory containing facets.json.
     required: false
     default: .
   dry-run:
-    description: Report what would change and stop. Nothing is committed, pushed, or opened.
+    description: Report what would change and stop without GitHub mutations.
     required: false
     default: 'false'
   open-pr:
-    description: Open a pull request when facets change. Set false to leave the branch pushed and nothing else.
+    description: Open or refresh a pull request when facets change.
     required: false
     default: 'true'
   branch:
-    description: Branch to push the update onto. Reused and force-updated on later runs.
+    description: Branch to push the update onto.
     required: false
     default: facet-updates
   base:
-    description: Branch the pull request targets. Defaults to the repository's default branch.
+    description: Branch the pull request targets. Defaults to the repository default branch.
     required: false
     default: ''
   commit-message:
-    description: First line of the commit message.
+    description: First line of the generated commit message.
     required: false
     default: 'chore(facets): update facets'
   pr-title:
     description: Title of the pull request.
     required: false
     default: 'chore(facets): update facets'
+  pr-author:
+    description: GitHub login expected to own generated pull requests.
+    required: false
+    default: 'github-actions[bot]'
   labels:
-    description: Comma-separated labels to apply to the pull request. A label that cannot be applied is logged and skipped.
+    description: Comma-separated labels to apply. Label failures are nonfatal.
     required: false
     default: ''
   token:
-    description: |
-      Token used for the pull request API calls (create, edit, label). It does
-      NOT authenticate the git push — that uses the credential actions/checkout
-      persisted. To push as a different identity, pass that token to
-      actions/checkout as well.
+    description: Token used for pull request API calls.
     required: false
     default: ${{ github.token }}
 
 outputs:
   updated:
-    description: '"true" when at least one facet changed version.'
+    description: '"true" when at least one facet changed.'
     value: ${{ steps.update.outputs.updated }}
   count:
-    description: How many facets changed version.
+    description: How many facets changed.
     value: ${{ steps.update.outputs.count }}
   pr-url:
-    description: URL of the pull request that was opened or updated, empty when none was.
-    value: ${{ steps.pr.outputs.pr-url }}
+    description: URL of the pull request opened or refreshed, empty when none was.
+    value: ${{ steps.update.outputs.pr-url }}
 
 runs:
   using: composite
   steps:
-    - name: Run facet update
+    - name: Publish facet update
       id: update
       shell: bash
       env:
@@ -85,191 +78,15 @@ runs:
         FACET_CLI_VERSION: ${{ inputs.cli-version }}
         FACET_WORKING_DIR: ${{ inputs.working-directory }}
         FACET_DRY_RUN: ${{ inputs.dry-run }}
-      run: |
-        set -euo pipefail
-        FACET_OUTPUT="$GITHUB_OUTPUT" bash "${GITHUB_ACTION_PATH}/scripts/facet-update.sh"
-
-    - name: Commit and push
-      id: push
-      if: steps.update.outputs.updated == 'true'
-      shell: bash
-      env:
         BRANCH: ${{ inputs.branch }}
         BASE: ${{ inputs.base }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         COMMIT_MESSAGE: ${{ inputs.commit-message }}
-        WORKING_DIR: ${{ inputs.working-directory }}
-        SUMMARY_B64: ${{ steps.update.outputs.summary }}
-      run: |
-        set -euo pipefail
-
-        # The branch name reaches git as an argument, so constrain it to
-        # something that cannot be read as a flag or a second token. Use
-        # bash's own [[ =~ ]] rather than grep: grep anchors per line, so a
-        # value containing a newline slips through a check that looks the same.
-        if [[ ! "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
-          echo "facet-update: branch must match [A-Za-z0-9][A-Za-z0-9._/-]*, got '${BRANCH}'" >&2
-          exit 2
-        fi
-        if [ -n "$BASE" ] && [[ ! "$BASE" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
-          echo "facet-update: base must match [A-Za-z0-9][A-Za-z0-9._/-]*, got '${BASE}'" >&2
-          exit 2
-        fi
-
-        # The whole point is to propose changes for review. Pushing the update
-        # straight onto the branch it would be reviewed against — or onto the
-        # default branch — defeats that, and on a repository without branch
-        # protection it lands unreviewed. Refuse rather than rely on the
-        # server to say no.
-        if [ -n "$BASE" ] && [ "$BRANCH" = "$BASE" ]; then
-          echo "facet-update: branch '${BRANCH}' is the branch this would open a pull request against." >&2
-          echo "  Choose a separate branch so the update can be reviewed." >&2
-          exit 2
-        fi
-        if [ -n "$DEFAULT_BRANCH" ] && [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
-          echo "facet-update: refusing to push updates directly onto the default branch '${DEFAULT_BRANCH}'." >&2
-          echo "  Set 'branch' to something else; the pull request is the point." >&2
-          exit 2
-        fi
-
-        BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
-        git config user.name "github-actions[bot]"
-        git config user.email "$BOT_EMAIL"
-
-        # actions/checkout only fetches the triggering ref, so the update
-        # branch is usually absent locally. Name the destination ref
-        # explicitly rather than relying on the remote's wildcard refspec to
-        # update it for us, so --force-with-lease below has a real baseline.
-        HAVE_REMOTE=false
-        if git fetch --depth=1 origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
-          HAVE_REMOTE=true
-        fi
-
-        # This branch gets force-replaced on every run, so the action has to
-        # own it. If it already exists and someone else wrote its tip, that is
-        # a human's branch and force-pushing would delete their work — and
-        # --force-with-lease would not stop it, because the lease was taken
-        # against the tip we just fetched. Every commit this action makes is
-        # authored by BOT_EMAIL, so authorship is an exact ownership test.
-        if [ "$HAVE_REMOTE" = true ]; then
-          TIP_AUTHOR="$(git log -1 --format='%ae' "refs/remotes/origin/${BRANCH}")"
-          if [ "$TIP_AUTHOR" != "$BOT_EMAIL" ]; then
-            echo "facet-update: refusing to force-push over branch '${BRANCH}'." >&2
-            echo "  Its latest commit is by '${TIP_AUTHOR}', not this action, so it is" >&2
-            echo "  someone's work and this run would replace it." >&2
-            echo "  Set 'branch' to a name this action can own, or delete that branch." >&2
-            exit 2
-          fi
-        fi
-
-        git checkout -B "$BRANCH"
-
-        # Updating rewrites facets.json and facets.lock, and also re-materializes
-        # each facet's assets into the adapter directories. Projects that track
-        # those assets need them in the same commit, or the pull request lands a
-        # manifest that disagrees with what is on disk. Anything the project
-        # ignores stays ignored.
-        git add -A -- "$WORKING_DIR"
-
-        # The lockfile is the only file that records what is actually
-        # installed, so a commit without it is not a reviewable update.
-        #
-        # Checking "did anything get staged" does not catch this: updating
-        # also rewrites facets.json and re-materializes assets, so a run whose
-        # facets.lock is gitignored still stages plenty and sails past that
-        # check — then opens a pull request whose manifest claims versions the
-        # lockfile never recorded. Ask about the lockfile directly instead.
-        # Tracked is the exact question: git stages a tracked file even when
-        # .gitignore also names it, and never stages one that is untracked.
-        LOCKFILE="${WORKING_DIR%/}/facets.lock"
-        if ! git ls-files --error-unmatch -- "$LOCKFILE" > /dev/null 2>&1; then
-          echo "facet-update: '${LOCKFILE}' is not tracked by git, so this update" >&2
-          echo "  cannot be committed or reviewed." >&2
-          echo "  Remove it from .gitignore, then 'git add ${LOCKFILE}' and commit it." >&2
-          exit 1
-        fi
-
-        # Belt and braces: a facet moved, so something must be staged.
-        if git diff --cached --quiet; then
-          echo "facet-update: facets moved but nothing is staged for commit." >&2
-          exit 1
-        fi
-
-        BODY="$(printf '%s' "$SUMMARY_B64" | base64 --decode)"
-        printf '%s\n\n%s\n' "$COMMIT_MESSAGE" "$BODY" | git commit --file=-
-
-        if [ "$HAVE_REMOTE" = true ]; then
-          git push --force-with-lease origin "$BRANCH"
-        else
-          git push origin "$BRANCH"
-        fi
-
-    - name: Open or update the pull request
-      id: pr
-      if: steps.update.outputs.updated == 'true' && inputs.open-pr == 'true'
-      shell: bash
-      env:
-        BRANCH: ${{ inputs.branch }}
-        BASE: ${{ inputs.base }}
         PR_TITLE: ${{ inputs.pr-title }}
+        PR_AUTHOR: ${{ inputs.pr-author }}
         LABELS: ${{ inputs.labels }}
-        STRATEGY: ${{ inputs.strategy }}
-        COUNT: ${{ steps.update.outputs.count }}
-        SUMMARY_B64: ${{ steps.update.outputs.summary }}
+        OPEN_PR: ${{ inputs.open-pr }}
         GH_TOKEN: ${{ inputs.token }}
-      run: |
-        set -euo pipefail
-
-        SUMMARY="$(printf '%s' "$SUMMARY_B64" | base64 --decode)"
-
-        if [ "$STRATEGY" = "latest" ]; then
-          NOTE='Each facet was moved to its newest release, so a pinned entry in `facets.json` was rewritten. A facet you deliberately held to a major line may appear here; close this pull request to keep it where it is.'
-        else
-          NOTE='Only facets whose new release satisfies the range already in `facets.json` were moved. Exactly-pinned entries were left alone.'
-        fi
-
-        BODY="$(printf '%s\n\n%s\n\n%s\n' \
-          "${COUNT} facet(s) changed." \
-          "$SUMMARY" \
-          "$NOTE")"
-
-        # Scope the lookup by base as well as head: the same head branch can
-        # have separate open pull requests into different bases, and editing
-        # the wrong one would overwrite a pull request meant for another target.
-        LIST_ARGS=(--head "$BRANCH" --state open --json url --jq '.[0].url // empty')
-        [ -n "$BASE" ] && LIST_ARGS+=(--base "$BASE")
-        EXISTING="$(gh pr list "${LIST_ARGS[@]}")"
-
-        # `gh pr create` fails with a bare "Resource not accessible by
-        # integration" when the workflow forgot pull-requests: write. Say what
-        # to fix instead of leaving that in a log nobody reads.
-        explain_pr_failure() {
-          echo "facet-update: could not create or update the pull request." >&2
-          echo "  The branch was pushed, so the update is not lost." >&2
-          echo "  If this says 'Resource not accessible by integration', the workflow" >&2
-          echo "  is missing:  permissions:  pull-requests: write" >&2
-        }
-
-        if [ -n "$EXISTING" ]; then
-          gh pr edit "$EXISTING" --title "$PR_TITLE" --body "$BODY" || { explain_pr_failure; exit 1; }
-          URL="$EXISTING"
-        else
-          CREATE_ARGS=(--head "$BRANCH" --title "$PR_TITLE" --body "$BODY")
-          [ -n "$BASE" ] && CREATE_ARGS+=(--base "$BASE")
-          URL="$(gh pr create "${CREATE_ARGS[@]}")" || { explain_pr_failure; exit 1; }
-        fi
-
-        # A label may fail for several reasons — it does not exist, or the token
-        # cannot manage labels. None of them are worth failing a run that has
-        # already produced a pull request, so log and carry on.
-        if [ -n "$LABELS" ]; then
-          IFS=',' read -ra PARSED <<< "$LABELS"
-          for label in "${PARSED[@]}"; do
-            trimmed="$(printf '%s' "$label" | tr -d '[:space:]')"
-            [ -z "$trimmed" ] && continue
-            gh pr edit "$URL" --add-label "$trimmed" || echo "facet-update: label '${trimmed}' could not be applied, skipping"
-          done
-        fi
-
-        echo "pr-url=${URL}" >> "$GITHUB_OUTPUT"
-        echo "facet-update: $URL"
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+      run: bash "${GITHUB_ACTION_PATH}/scripts/publish-update.sh"
