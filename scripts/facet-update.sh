@@ -16,13 +16,13 @@
 #   FACET_OUTPUT        file to append key=value results to (default: none)
 #
 # Results (written to FACET_OUTPUT, and always printed):
-#   updated=true|false      whether any facet version moved
-#   count=<n>               how many facets changed version
+#   updated=true|false      whether any lock entry changed
+#   count=<n>               how many lock entries changed
 #   summary=<markdown>      a table of what changed, base64-encoded
 #
 # Exit status: 0 on success, non-zero only when the update genuinely failed.
 # Note that the facet CLI itself exits 0 whether or not anything moved, which
-# is why this script works out "did anything change" for itself.
+# is why this script works out "did any lock entry change" for itself.
 
 set -euo pipefail
 
@@ -87,22 +87,34 @@ if [ ! -f facets.lock ]; then
   exit 2
 fi
 
-# Record the locked versions before we touch anything, so the summary can say
-# what moved rather than just that something did.
+# Record the complete locked entries before we touch anything. A version alone
+# is not the lock state: a changed integrity or asset set needs reporting too.
 snapshot() {
   # shellcheck disable=SC2016  # ${...} below is a JS template literal, not shell
   node -e '
     const fs = require("fs")
-    if (!fs.existsSync("facets.lock")) { console.log("{}"); process.exit(0) }
     try {
+      if (!fs.existsSync("facets.lock")) throw new Error("file is missing")
       const lock = JSON.parse(fs.readFileSync("facets.lock", "utf8"))
+      if (lock === null || typeof lock !== "object" || Array.isArray(lock)) {
+        throw new Error("root must be an object")
+      }
+      if (lock.lockfileVersion !== 0.2 && lock.lockfileVersion !== 0.3) {
+        throw new Error("lockfileVersion must be numeric 0.2 or 0.3")
+      }
+      if (lock.facets === null || typeof lock.facets !== "object" || Array.isArray(lock.facets)) {
+        throw new Error("facets must be an object")
+      }
       const out = {}
-      for (const [name, entry] of Object.entries(lock.facets ?? {})) out[name] = entry.version
+      for (const [name, entry] of Object.entries(lock.facets)) {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+          throw new Error(`facet ${name} must be an object`)
+        }
+        out[name] = entry
+      }
       console.log(JSON.stringify(out))
     } catch (err) {
-      // Swallowing this would make a corrupt lockfile read as an empty one,
-      // and every facet would then look newly added.
-      process.stderr.write(`facet-update: facets.lock is not valid JSON (${err.message})\n`)
+      process.stderr.write(`facet-update: invalid facets.lock (${err.message})\n`)
       process.exit(1)
     }
   '
@@ -135,17 +147,26 @@ AFTER="$(snapshot)"
 # facets.lock that is untracked or gitignored, and in that case it reports no
 # change even though every facet moved. The lockfile is the ground truth for
 # "what version is installed", so compare that directly.
+# shellcheck disable=SC2016  # the ${...} below are JS template literals, not shell
 CHANGES="$(BEFORE="$BEFORE" AFTER="$AFTER" node -e '
   const before = JSON.parse(process.env.BEFORE)
   const after = JSON.parse(process.env.AFTER)
+  const stable = value => {
+    if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`
+    }
+    return JSON.stringify(value)
+  }
+  const displayVersion = entry => typeof entry.version === "string" ? entry.version : "unknown"
   const rows = []
   for (const [name, to] of Object.entries(after)) {
     const from = before[name]
-    if (from === undefined) rows.push({ name, from: "—", to, kind: "added" })
-    else if (from !== to) rows.push({ name, from, to, kind: "updated" })
+    if (from === undefined) rows.push({ name, from: "—", to: displayVersion(to), kind: "added" })
+    else if (stable(from) !== stable(to)) rows.push({ name, from: displayVersion(from), to: displayVersion(to), kind: "updated" })
   }
   for (const name of Object.keys(before)) {
-    if (!(name in after)) rows.push({ name, from: before[name], to: "—", kind: "removed" })
+    if (!(name in after)) rows.push({ name, from: displayVersion(before[name]), to: "—", kind: "removed" })
   }
   rows.sort((a, b) => a.name.localeCompare(b.name))
   console.log(JSON.stringify(rows))
@@ -164,6 +185,8 @@ SUMMARY="$(CHANGES="$CHANGES" node -e '
 
 if [ "$DRY_RUN" = "true" ]; then
   CHANGED=false
+  COUNT=0
+  SUMMARY=""
 elif [ "$COUNT" -gt 0 ]; then
   CHANGED=true
 else
