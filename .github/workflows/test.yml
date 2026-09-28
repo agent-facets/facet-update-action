@@ -92,13 +92,9 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/published-cli
-          node -e '
-            const fs = require("fs")
-            const lock = JSON.parse(fs.readFileSync("facets.lock", "utf8"))
-            for (const entry of Object.values(lock.facets)) entry.version = "1.0.0"
-            fs.writeFileSync("facets.lock", JSON.stringify(lock, null, 2) + "\n")
-          '
-          sha256sum facets.json facets.lock > /tmp/published-cli.sha
+          git restore --source=HEAD^ --worktree -- .
+          git ls-tree -r -z --name-only HEAD^ | LC_ALL=C sort -z | xargs -0 -r sha256sum -- > /tmp/published-cli.sha
+          test -s /tmp/published-cli.sha
           if ! FACET_DRY_RUN=true FACET_OUTPUT=/tmp/dry-run.out \
             FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
             bash "$GITHUB_WORKSPACE/scripts/facet-update.sh" \

@@ -145,6 +145,9 @@ reject('published CLI dry-run step missing') unless dry_run_step
 dry_run_lines = dry_run_step.fetch('run').lines.map(&:strip)
 result_line = 'facet-update: updated=false count=0'
 required_dry_run_commands = {
+  'valid prior installation restore' => 'git restore --source=HEAD^ --worktree -- .',
+  'complete tracked file manifest' => 'git ls-tree -r -z --name-only HEAD^ | LC_ALL=C sort -z | xargs -0 -r sha256sum -- > /tmp/published-cli.sha',
+  'nonempty tracked file manifest' => 'test -s /tmp/published-cli.sha',
   'exactly one result line' => %q{result_count="$(grep -Fxc -- 'facet-update: updated=false count=0' /tmp/dry-run.log || true)"},
   'result count check' => %q{[ "$result_count" = 1 ] || { echo "expected one dry-run result line, found $result_count"; exit 1; }},
   'final console line' => %q{[ "$(tail -n 1 /tmp/dry-run.log)" = 'facet-update: updated=false count=0' ] || { echo 'dry-run result was not the final console line'; exit 1; }},
@@ -155,6 +158,13 @@ required_dry_run_commands = {
 required_dry_run_commands.each do |claim, command|
   reject("published CLI dry-run missing #{claim}") unless dry_run_lines.include?(command)
 end
+restore_index = dry_run_lines.index(required_dry_run_commands.fetch('valid prior installation restore'))
+manifest = required_dry_run_commands.fetch('complete tracked file manifest')
+manifest_index = dry_run_lines.index(manifest)
+dry_run_index = dry_run_lines.index { |line| line.include?('FACET_DRY_RUN=true FACET_OUTPUT=/tmp/dry-run.out') }
+reject('published CLI dry-run must restore and hash prior installation before execution') unless dry_run_index && restore_index < manifest_index && manifest_index < dry_run_index
+reject('published CLI dry-run must hash only the complete tracked file manifest') unless dry_run_lines.select { |line| line.end_with?('> /tmp/published-cli.sha') } == [manifest]
+reject('published CLI dry-run must not corrupt installed lock entries') if dry_run_lines.any? { |line| line.include?('entry.version = "1.0.0"') }
 reject('published CLI dry-run must allow preceding diagnostics') if dry_run_lines.any? { |line| line.match?(/\Acmp .*\/tmp\/dry-run\.log\z/) }
 
 action_steps = workflow.fetch('jobs').fetch('action').fetch('steps')
@@ -230,7 +240,7 @@ run_mutation_probe() {
   if DOCS_CONTRACT_README="$probe_readme" DOCS_CONTRACT_SKIP_PROBES=1 bash "$0" >"$probe_output" 2>&1; then
     fail "mutation probe unexpectedly passed: $label"
   fi
-  rg -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
+  grep -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
   echo "docs contract mutation: $label rejected"
 }
 
@@ -242,7 +252,7 @@ run_workflow_mutation_probe() {
   if DOCS_CONTRACT_WORKFLOW="$probe_workflow" DOCS_CONTRACT_SKIP_PROBES=1 bash "$0" >"$probe_output" 2>&1; then
     fail "mutation probe unexpectedly passed: $label"
   fi
-  rg -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
+  grep -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
   echo "docs contract mutation: $label rejected"
 }
 
@@ -280,6 +290,20 @@ if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
     anchor = "tail -n 1 /tmp/dry-run.log"
     abort "mutation anchor missing" unless text.include?(anchor)
     File.write(path, text.sub(anchor, "head -n 1 /tmp/dry-run.log"))
+  '
+  run_workflow_mutation_probe corrupt-dry-run-lock 'published CLI dry-run must not corrupt installed lock entries' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "git restore --source=HEAD^ --worktree -- ."
+    abort "mutation anchor missing" unless text.include?(anchor)
+    q = 39.chr
+    corruption = "node -e #{q}const fs = require(\"fs\"); const lock = JSON.parse(fs.readFileSync(\"facets.lock\", \"utf8\")); for (const entry of Object.values(lock.facets)) entry.version = \"1.0.0\"; fs.writeFileSync(\"facets.lock\", JSON.stringify(lock))#{q}"
+    File.write(path, text.sub(anchor, "#{anchor}\n          #{corruption}"))
+  '
+  run_workflow_mutation_probe metadata-only-dry-run-hash 'published CLI dry-run missing complete tracked file manifest' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "git ls-tree -r -z --name-only HEAD^ | LC_ALL=C sort -z | xargs -0 -r sha256sum -- > /tmp/published-cli.sha"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "sha256sum facets.json facets.lock > /tmp/published-cli.sha"))
   '
   run_workflow_mutation_probe missing-published-adapter 'published CLI fixture must configure pinned Codex adapter before install' '
     path = ARGV.fetch(0); text = File.read(path)
