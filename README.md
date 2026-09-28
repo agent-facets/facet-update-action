@@ -28,7 +28,7 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: agent-facets/facet-update-action@v1
         with:
           cli-version: '0.33.1'
@@ -118,7 +118,7 @@ The job needs `contents: write` to push and `pull-requests: write` to create or 
 `token` is used for the pull-request API only. To use a custom App token or PAT consistently, give the same credential to both checkout and this action:
 
 ```yaml
-- uses: actions/checkout@v4
+- uses: actions/checkout@v7
   with:
     token: ${{ secrets.FACET_UPDATE_TOKEN }}
 - uses: agent-facets/facet-update-action@v1

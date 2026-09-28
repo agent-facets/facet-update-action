@@ -120,7 +120,7 @@ custom_branch = yaml_blocks(readme, 'Update branch').fetch(0)
 assert_branch_concurrency(custom_branch, inputs.dig('branch', 'default'), 'custom-branch example')
 
 credential_example = yaml_blocks(readme, 'Permissions').fetch(0)
-checkout_step = credential_example.find { |step| step['uses'] == 'actions/checkout@v4' }
+checkout_step = credential_example.find { |step| step['uses'] == 'actions/checkout@v7' }
 credential_action = credential_example.find { |step| step['uses'] == 'agent-facets/facet-update-action@v1' }
 reject('Permissions custom credential example missing checkout') unless checkout_step
 reject('Permissions custom credential example missing action') unless credential_action
@@ -169,7 +169,7 @@ reject('published CLI dry-run must allow preceding diagnostics') if dry_run_line
 
 action_steps = workflow.fetch('jobs').fetch('action').fetch('steps')
 action_checkout = action_steps.first
-reject('action CI must use a full-depth checkout before pushing fixture to bare origin') unless action_checkout['uses'] == 'actions/checkout@v4' && action_checkout.dig('with', 'fetch-depth') == 0
+reject('action CI must use a full-depth checkout before pushing fixture to bare origin') unless action_checkout['uses'] == 'actions/checkout@v7' && action_checkout.dig('with', 'fetch-depth') == 0
 fixture_step = action_steps.find { |step| step['name'] == 'Build and publish a local fixture base' }
 reject('action CI tracked fixture setup missing') unless fixture_step
 require_published_adapter_before_install(action_steps, 'Build and publish a local fixture base', 'action CI fixture')
