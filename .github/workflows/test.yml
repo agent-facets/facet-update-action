@@ -106,8 +106,9 @@ jobs:
             exit 1
           fi
           cat /tmp/dry-run.log
-          printf 'facet-update: updated=false count=0\n' > /tmp/dry-run-log.expected
-          cmp /tmp/dry-run-log.expected /tmp/dry-run.log
+          result_count="$(grep -Fxc -- 'facet-update: updated=false count=0' /tmp/dry-run.log || true)"
+          [ "$result_count" = 1 ] || { echo "expected one dry-run result line, found $result_count"; exit 1; }
+          [ "$(tail -n 1 /tmp/dry-run.log)" = 'facet-update: updated=false count=0' ] || { echo 'dry-run result was not the final console line'; exit 1; }
           printf 'updated=false\ncount=0\nsummary=\n' > /tmp/dry-run.expected
           cmp /tmp/dry-run.expected /tmp/dry-run.out
           sha256sum --check --status /tmp/published-cli.sha
@@ -122,19 +123,27 @@ jobs:
         run: |
           ruby -e "require 'yaml'; action = YAML.load_file('action.yml'); abort 'cli-version default is not pinned' unless action.fetch('inputs').fetch('cli-version').fetch('default') == ENV.fetch('FACET_CLI_PIN')"
 
-      # A fixture the action can point at, so this exercises action.yml's own
-      # input plumbing rather than only the script.
-      - name: Build a fixture
+      # Keep the action implementation in this checkout while giving the
+      # publisher a tracked fixture on its selected remote base.
+      - name: Build and publish a local fixture base
         run: |
           set -euo pipefail
+          git config user.email fixture@example.invalid
+          git config user.name 'CI fixture'
           mkdir -p fixture && cd fixture
           printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
           npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null
+          cd "$GITHUB_WORKSPACE"
+          git add -A -- fixture
+          git -c commit.gpgsign=false commit -m 'test: add tracked facet fixture'
+          fixture_remote="$(mktemp -d "${RUNNER_TEMP}/facet-update-origin.XXXXXX")"
+          git init --bare "$fixture_remote"
+          git remote set-url origin "$fixture_remote"
+          git push origin HEAD:refs/heads/ci-fixture-base
+          git ls-files --error-unmatch -- fixture/facets.json fixture/facets.lock
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ]
 
-      # dry-run proves the action resolves its inputs and runs the CLI without
-      # reaching the push or pull-request steps, so this needs no write token.
-      # Record the exact bytes first: the fixture is untracked, so a git-based
-      # check would pass without proving anything.
+      # Record bytes before the composite action switches to the selected base.
       - name: Record fixture state
         run: |
           set -euo pipefail
@@ -145,6 +154,7 @@ jobs:
         uses: ./
         with:
           working-directory: fixture
+          base: ci-fixture-base
           strategy: latest
           dry-run: 'true'
 
@@ -152,11 +162,9 @@ jobs:
         env:
           UPDATED: ${{ steps.dry.outputs.updated }}
           COUNT: ${{ steps.dry.outputs.count }}
-          SUMMARY: ${{ steps.dry.outputs.summary }}
         run: |
           set -euo pipefail
           [ "$UPDATED" = "false" ] || { echo "dry-run reported updated=$UPDATED"; exit 1; }
           [ "$COUNT" = "0" ] || { echo "dry-run reported count=$COUNT"; exit 1; }
-          [ -z "$SUMMARY" ] || { echo "dry-run reported summary=$SUMMARY"; exit 1; }
           sha256sum --check --status /tmp/fixture.sha \
             || { echo "dry-run modified the fixture"; exit 1; }

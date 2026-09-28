@@ -79,7 +79,7 @@ The standard workflow assumes a GitHub-hosted Ubuntu runner with Bash, Git, Node
 | `count` | Number of changed facet entries: upgrades, downgrades, additions, and removals. The action's dry-run report is the shared zero-change result below, not a proposed-change count. |
 | `pr-url` | URL of the pull request opened or refreshed, empty when none was. |
 
-The shared no-change and dry-run output is exactly:
+For no-change and dry-run, the final console result line is followed here by the three exact machine-output file lines. The CLI may print diagnostics before the result line:
 
 ```text
 facet-update: updated=false count=0

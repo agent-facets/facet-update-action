@@ -15,7 +15,7 @@ readme_path, action_path, example_path, workflow_path = ARGV
 readme = File.read(readme_path)
 action = YAML.load_file(action_path)
 example = YAML.load_file(example_path)
-workflow = File.read(workflow_path)
+workflow = YAML.load_file(workflow_path)
 
 def reject(message)
   warn "docs contract: #{message}"
@@ -128,12 +128,50 @@ checkout_token = checkout_step.dig('with', 'token')
 action_token = credential_action.dig('with', 'token')
 reject('Permissions custom credential must be supplied to checkout and action') unless checkout_token == '${{ secrets.FACET_UPDATE_TOKEN }}' && action_token == checkout_token
 
-log_literal = workflow[/printf '([^']*)' > \/tmp\/dry-run-log\.expected/, 1]
-output_literal = workflow[/printf '([^']*)' > \/tmp\/dry-run\.expected/, 1]
-reject('authoritative workflow dry-run assertions missing') unless log_literal && output_literal
-expected_dry_run = (log_literal + output_literal).gsub('\\n', "\n").sub(/\n\z/, '')
+published_steps = workflow.fetch('jobs').fetch('published-cli').fetch('steps')
+dry_run_step = published_steps.find { |step| step['name'] == 'Preserve bytes during dry-run' }
+reject('published CLI dry-run step missing') unless dry_run_step
+dry_run_lines = dry_run_step.fetch('run').lines.map(&:strip)
+result_line = 'facet-update: updated=false count=0'
+required_dry_run_commands = {
+  'exactly one result line' => %q{result_count="$(grep -Fxc -- 'facet-update: updated=false count=0' /tmp/dry-run.log || true)"},
+  'result count check' => %q{[ "$result_count" = 1 ] || { echo "expected one dry-run result line, found $result_count"; exit 1; }},
+  'final console line' => %q{[ "$(tail -n 1 /tmp/dry-run.log)" = 'facet-update: updated=false count=0' ] || { echo 'dry-run result was not the final console line'; exit 1; }},
+  'exact machine output' => %q{printf 'updated=false\ncount=0\nsummary=\n' > /tmp/dry-run.expected},
+  'machine output comparison' => 'cmp /tmp/dry-run.expected /tmp/dry-run.out',
+  'byte identity' => 'sha256sum --check --status /tmp/published-cli.sha'
+}
+required_dry_run_commands.each do |claim, command|
+  reject("published CLI dry-run missing #{claim}") unless dry_run_lines.include?(command)
+end
+reject('published CLI dry-run must allow preceding diagnostics') if dry_run_lines.any? { |line| line.match?(/\Acmp .*\/tmp\/dry-run\.log\z/) }
+
+action_steps = workflow.fetch('jobs').fetch('action').fetch('steps')
+fixture_step = action_steps.find { |step| step['name'] == 'Build and publish a local fixture base' }
+reject('action CI tracked fixture setup missing') unless fixture_step
+fixture_run = fixture_step.fetch('run')
+%w[git\ add\ -A\ --\ fixture git\ init\ --bare git\ remote\ set-url\ origin git\ push\ origin\ HEAD:refs/heads/ci-fixture-base git\ ls-files\ --error-unmatch].each do |command|
+  reject("action CI fixture setup missing #{command}") unless fixture_run.include?(command)
+end
+reject('action CI fixture commit missing') unless fixture_run.include?("git -c commit.gpgsign=false commit -m 'test: add tracked facet fixture'")
+reject('action CI fixture must be clean') unless fixture_run.include?('[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]')
+action_step = action_steps.find { |step| step['uses'] == './' }
+reject('action CI composite invocation missing') unless action_step
+reject('action CI must select fixture remote base') unless action_step.dig('with', 'base') == 'ci-fixture-base'
+reject('action CI must select tracked fixture directory') unless action_step.dig('with', 'working-directory') == 'fixture'
+reject('action CI must run dry-run') unless action_step.dig('with', 'dry-run').to_s == 'true'
+output_step = action_steps.find { |step| step['name'] == 'Dry-run reports no change and writes nothing' }
+reject('action CI output assertion missing') unless output_step
+reject('action CI must not assert undeclared summary output') if output_step.fetch('env').key?('SUMMARY') || output_step.fetch('run').include?('$SUMMARY')
+
+output_literal = dry_run_lines.find { |line| line.start_with?("printf '") && line.end_with?(' > /tmp/dry-run.expected') }
+reject('published CLI dry-run expected machine-output literal missing') unless output_literal
+machine_lines = output_literal.delete_prefix("printf '").delete_suffix("' > /tmp/dry-run.expected").gsub('\\n', "\n")
+expected_dry_run = result_line + "\n" + machine_lines
 output_text_blocks = fenced_blocks(section(readme, 'Outputs'), 'text')
-reject('Outputs missing exact workflow-sourced four-line dry-run result') unless output_text_blocks == [expected_dry_run + "\n"]
+reject('Outputs missing final console result plus three machine lines') unless output_text_blocks == [expected_dry_run]
+require_claim(section(readme, 'Outputs'), 'Outputs', 'result is the final console line, with preceding diagnostics allowed', 'The CLI may print diagnostics before the result line')
+require_claim(section(readme, 'Outputs'), 'Outputs', 'machine output file has three exact lines', 'three exact machine-output file lines')
 
 requirements = section(readme, 'Requirements')
 require_claim(requirements, 'Requirements', 'clean tree is insufficient without tracked facets.lock', 'The action rejects a missing, ignored, or untracked lockfile: a clean working tree alone is not evidence that the lockfile records the proposed versions.')
@@ -182,6 +220,18 @@ run_mutation_probe() {
   echo "docs contract mutation: $label rejected"
 }
 
+run_workflow_mutation_probe() {
+  local label="$1" expected="$2" mutation="$3"
+  local probe_workflow="$probe_dir/$label.yml" probe_output="$probe_dir/$label.out"
+  cp "$workflow" "$probe_workflow"
+  ruby -e "$mutation" "$probe_workflow"
+  if DOCS_CONTRACT_WORKFLOW="$probe_workflow" DOCS_CONTRACT_SKIP_PROBES=1 bash "$0" >"$probe_output" 2>&1; then
+    fail "mutation probe unexpectedly passed: $label"
+  fi
+  rg -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
+  echo "docs contract mutation: $label rejected"
+}
+
 if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
   probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/docs-contract.XXXXXX")"
   trap 'rm -rf "$probe_dir"' EXIT
@@ -204,6 +254,30 @@ if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
     row = "| `v1` | Convenient major-line tag; it can move to compatible releases and therefore depends on the repository\x27s immutable-release policy. |"
     abort "mutation anchor missing" unless text.include?(row)
     File.write(path, text.sub(row, "| `v1.0.0` | Duplicate patch row. |"))
+  '
+  run_mutation_probe false-complete-console-promise 'Outputs missing claim: result is the final console line, with preceding diagnostics allowed' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "The CLI may print diagnostics before the result line"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "The console contains only the result line"))
+  '
+  run_workflow_mutation_probe missing-final-result-check 'published CLI dry-run missing final console line' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "tail -n 1 /tmp/dry-run.log"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "head -n 1 /tmp/dry-run.log"))
+  '
+  run_workflow_mutation_probe untracked-action-fixture 'action CI fixture setup missing git add -A -- fixture' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "git add -A -- fixture"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "git status --short -- fixture"))
+  '
+  run_workflow_mutation_probe wrong-action-base 'action CI must select fixture remote base' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "base: ci-fixture-base"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "base: main"))
   '
 fi
 
