@@ -147,6 +147,8 @@ end
 reject('published CLI dry-run must allow preceding diagnostics') if dry_run_lines.any? { |line| line.match?(/\Acmp .*\/tmp\/dry-run\.log\z/) }
 
 action_steps = workflow.fetch('jobs').fetch('action').fetch('steps')
+action_checkout = action_steps.first
+reject('action CI must use a full-depth checkout before pushing fixture to bare origin') unless action_checkout['uses'] == 'actions/checkout@v4' && action_checkout.dig('with', 'fetch-depth') == 0
 fixture_step = action_steps.find { |step| step['name'] == 'Build and publish a local fixture base' }
 reject('action CI tracked fixture setup missing') unless fixture_step
 fixture_run = fixture_step.fetch('run')
@@ -278,6 +280,18 @@ if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
     anchor = "base: ci-fixture-base"
     abort "mutation anchor missing" unless text.include?(anchor)
     File.write(path, text.sub(anchor, "base: main"))
+  '
+  run_workflow_mutation_probe default-shallow-checkout 'action CI must use a full-depth checkout before pushing fixture to bare origin' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "        with:\n          fetch-depth: 0\n"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, ""))
+  '
+  run_workflow_mutation_probe depth-one-checkout 'action CI must use a full-depth checkout before pushing fixture to bare origin' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "          fetch-depth: 0"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "          fetch-depth: 1"))
   '
 fi
 
