@@ -35,8 +35,12 @@ case "$STRATEGY" in latest | in-range) ;; *) fail "strategy must be 'latest' or 
 [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail "invalid repository"
 [ "${GITHUB_REPOSITORY%%/*}" = "$GITHUB_REPOSITORY_OWNER" ] || fail "repository owner does not match repository"
 [ -n "$DEFAULT_BRANCH" ] || fail 'default branch is required'
-[ -n "$COMMIT_MESSAGE" ] && [[ "$COMMIT_MESSAGE" != *$'\n'* ]] || fail 'commit-message must be one non-empty line'
-[ -n "$PR_TITLE" ] && [[ "$PR_TITLE" != *$'\n'* ]] || fail 'pr-title must be one non-empty line'
+if [ -z "$COMMIT_MESSAGE" ] || [[ "$COMMIT_MESSAGE" == *$'\n'* ]]; then
+  fail 'commit-message must be one non-empty line'
+fi
+if [ -z "$PR_TITLE" ] || [[ "$PR_TITLE" == *$'\n'* ]]; then
+  fail 'pr-title must be one non-empty line'
+fi
 git check-ref-format --branch "$BRANCH" >/dev/null 2>&1 || fail "invalid branch '${BRANCH}'"
 EFFECTIVE_BASE="${BASE:-$DEFAULT_BRANCH}"
 git check-ref-format --branch "$EFFECTIVE_BASE" >/dev/null 2>&1 || fail "invalid base '${EFFECTIVE_BASE}'"

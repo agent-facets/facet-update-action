@@ -129,6 +129,17 @@ action_token = credential_action.dig('with', 'token')
 reject('Permissions custom credential must be supplied to checkout and action') unless checkout_token == '${{ secrets.FACET_UPDATE_TOKEN }}' && action_token == checkout_token
 
 published_steps = workflow.fetch('jobs').fetch('published-cli').fetch('steps')
+def require_published_adapter_before_install(steps, step_name, label)
+  install_step = steps.find { |step| step['name'] == step_name }
+  reject("#{label} install step missing") unless install_step
+  lines = install_step.fetch('run').lines.map(&:strip)
+  adapter = 'npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null'
+  install = 'npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null'
+  reject("#{label} must configure pinned Codex adapter before install") unless
+    lines.count(adapter) == 1 && lines.count(install) == 1 && lines.index(adapter) < lines.index(install)
+end
+
+require_published_adapter_before_install(published_steps, 'Install with the published CLI', 'published CLI fixture')
 dry_run_step = published_steps.find { |step| step['name'] == 'Preserve bytes during dry-run' }
 reject('published CLI dry-run step missing') unless dry_run_step
 dry_run_lines = dry_run_step.fetch('run').lines.map(&:strip)
@@ -151,6 +162,7 @@ action_checkout = action_steps.first
 reject('action CI must use a full-depth checkout before pushing fixture to bare origin') unless action_checkout['uses'] == 'actions/checkout@v4' && action_checkout.dig('with', 'fetch-depth') == 0
 fixture_step = action_steps.find { |step| step['name'] == 'Build and publish a local fixture base' }
 reject('action CI tracked fixture setup missing') unless fixture_step
+require_published_adapter_before_install(action_steps, 'Build and publish a local fixture base', 'action CI fixture')
 fixture_run = fixture_step.fetch('run')
 %w[git\ add\ -A\ --\ fixture git\ init\ --bare git\ remote\ set-url\ origin git\ push\ origin\ HEAD:refs/heads/ci-fixture-base git\ ls-files\ --error-unmatch].each do |command|
   reject("action CI fixture setup missing #{command}") unless fixture_run.include?(command)
@@ -268,6 +280,19 @@ if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
     anchor = "tail -n 1 /tmp/dry-run.log"
     abort "mutation anchor missing" unless text.include?(anchor)
     File.write(path, text.sub(anchor, "head -n 1 /tmp/dry-run.log"))
+  '
+  run_workflow_mutation_probe missing-published-adapter 'published CLI fixture must configure pinned Codex adapter before install' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null}
+    abort "mutation anchor count differs" unless text.scan(anchor).length == 2
+    File.write(path, text.sub(anchor, ""))
+  '
+  run_workflow_mutation_probe missing-action-adapter 'action CI fixture must configure pinned Codex adapter before install' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null}
+    abort "mutation anchor count differs" unless text.scan(anchor).length == 2
+    offset = text.rindex(anchor)
+    File.write(path, text[0...offset] + text[(offset + anchor.length)..])
   '
   run_workflow_mutation_probe untracked-action-fixture 'action CI fixture setup missing git add -A -- fixture' '
     path = ARGV.fetch(0); text = File.read(path)
