@@ -9,9 +9,9 @@ on:
 permissions:
   contents: read
 
-# Both jobs assume a GitHub-hosted runner: shellcheck is preinstalled and the
-# npm registry is reachable. On a self-hosted or network-restricted runner they
-# fail for reasons unrelated to the code under test.
+# The shell-suites job assumes a GitHub-hosted runner with shellcheck installed.
+# The published-cli and action jobs additionally require npm registry access;
+# self-hosted or network-restricted runners can fail for environmental reasons.
 env:
   # Pinned so a new CLI release cannot turn this suite red on its own.
   FACET_CLI_PIN: '0.33.1'
@@ -98,14 +98,16 @@ jobs:
             fs.writeFileSync("facets.lock", JSON.stringify(lock, null, 2) + "\n")
           '
           sha256sum facets.json facets.lock > /tmp/published-cli.sha
-          if ! dry_run_log=$(FACET_DRY_RUN=true FACET_OUTPUT=/tmp/dry-run.out \
+          if ! FACET_DRY_RUN=true FACET_OUTPUT=/tmp/dry-run.out \
             FACET_STRATEGY=latest FACET_CLI_VERSION="$FACET_CLI_PIN" \
-            bash "$GITHUB_WORKSPACE/scripts/facet-update.sh" 2>&1); then
-            printf '%s\n' "$dry_run_log"
+            bash "$GITHUB_WORKSPACE/scripts/facet-update.sh" \
+            > /tmp/dry-run.log 2>&1; then
+            cat /tmp/dry-run.log
             exit 1
           fi
-          printf '%s\n' "$dry_run_log"
-          grep -Fxq 'facet-update: updated=false count=0' <<< "$dry_run_log"
+          cat /tmp/dry-run.log
+          printf 'facet-update: updated=false count=0\n' > /tmp/dry-run-log.expected
+          cmp /tmp/dry-run-log.expected /tmp/dry-run.log
           printf 'updated=false\ncount=0\nsummary=\n' > /tmp/dry-run.expected
           cmp /tmp/dry-run.expected /tmp/dry-run.out
           sha256sum --check --status /tmp/published-cli.sha
