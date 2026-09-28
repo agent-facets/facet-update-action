@@ -1,6 +1,6 @@
 # Facet Update Action
 
-Keep the facets a repository declares up to date on a schedule, with one reviewable pull request for the update. Nothing is merged automatically.
+Keep a repository's declared facets current. The action runs on a schedule, opens one pull request for the update, and never merges it.
 
 ## Quickstart
 
@@ -18,8 +18,8 @@ permissions:
   contents: write
   pull-requests: write
 
-# One repository and its facet-updates branch share one queue. Do not cancel a
-# run that is already preparing the branch.
+# Queue runs for this repository's facet-updates branch. Let a run finish once
+# it has started preparing the branch.
 concurrency:
   group: facet-update-${{ github.repository }}-facet-updates
   cancel-in-progress: false
@@ -34,7 +34,7 @@ jobs:
           cli-version: '0.33.1'
 ```
 
-Both permissions are required; see [Permissions](#permissions). Keep `workflow_dispatch` so you can test without waiting for the schedule.
+Both permissions are required; see [Permissions](#permissions). `workflow_dispatch` lets you test the action without waiting for the schedule.
 
 ## Requirements
 
@@ -44,7 +44,7 @@ The standard workflow assumes a GitHub-hosted Ubuntu runner with Bash, Git, Node
 
 ## Choosing a schedule
 
-`cron` is standard five-field UTC cron. GitHub evaluates scheduled workflows on the default branch and can delay a run when the runner fleet is busy; see GitHub's [scheduled events documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+`cron` uses five fields in UTC. GitHub runs scheduled workflows from the default branch and may delay a run when runners are busy; see the [scheduled events documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
 | When | `cron` |
 | --- | --- |
@@ -92,7 +92,7 @@ summary=
 
 The action owns `branch` and uses an explicit `--force-with-lease` against the fetched tip. If another concurrent run changes that tip, the losing run refuses to push; it does not overwrite the winner. If the existing tip was not made by `github-actions[bot]`, it also refuses to replace it. These are structural provenance checks for a trusted repository, not cryptographic proof of who authored a commit and not a security boundary against a repository attacker.
 
-Use a branch reserved to this action. When you change `branch`, change the last segment of `concurrency.group` to the same literal; otherwise updates for that branch are not serialized. GitHub documents the [concurrency group behavior](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+Reserve the branch for this action. If you change `branch`, change the last segment of `concurrency.group` to the same literal. That keeps runs for the branch in one queue. GitHub documents [concurrency groups](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 
 ```yaml
 concurrency:

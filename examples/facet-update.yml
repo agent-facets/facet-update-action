@@ -1,4 +1,4 @@
-# Copy this to .github/workflows/facet-update.yml in your repository.
+# Save this as .github/workflows/facet-update.yml in your repository.
 name: Facet update
 
 on:
@@ -10,8 +10,8 @@ permissions:
   contents: write
   pull-requests: write
 
-# Queue runs for this repository's facet-updates branch; never cancel an
-# in-progress update that has already inspected the branch tip.
+# Queue runs for this repository's facet-updates branch. Let a run finish once
+# it has started preparing the branch.
 concurrency:
   group: facet-update-${{ github.repository }}-facet-updates
   cancel-in-progress: false
