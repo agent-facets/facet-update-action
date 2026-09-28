@@ -98,18 +98,20 @@ Use a branch reserved to this action. When you change `branch`, change the last 
 concurrency:
   group: facet-update-${{ github.repository }}-weekly-facet-updates
   cancel-in-progress: false
-# ...
-- uses: agent-facets/facet-update-action@v1
-  with:
-    branch: weekly-facet-updates
-    cli-version: '0.33.1'
+jobs:
+  update:
+    steps:
+      - uses: agent-facets/facet-update-action@v1
+        with:
+          branch: weekly-facet-updates
+          cli-version: '0.33.1'
 ```
 
 A closed historical pull request is not reused: the next update creates a new PR. One matching open PR is refreshed as the branch advances. `open-pr: false` can create an absent update branch, but it cannot refresh an existing update branch; use `open-pr: true` for recurring updates.
 
 ## Permissions
 
-The job needs `contents: write` to push and `pull-requests: write` to create or refresh the pull request. Repository or organization Actions settings must also allow GitHub Actions to create pull requests. GitHub documents [setting `GITHUB_TOKEN` permissions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token).
+The job needs `contents: write` to push and `pull-requests: write` to create or refresh the pull request. GitHub documents [setting `GITHUB_TOKEN` permissions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token). Repository or organization Actions settings must also enable [Allow GitHub Actions to create and approve pull requests](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#preventing-github-actions-from-creating-or-approving-pull-requests).
 
 `pr-author` is an assertion, not a way to choose an identity: the created or refreshed PR must be owned by that login (default `github-actions[bot]`) or the action fails. The default `GITHUB_TOKEN` creates PR events in GitHub's approval-required workflow state, so downstream checks do not begin automatically. An App installation token or PAT can create events that start checks automatically, subject to your repository settings.
 

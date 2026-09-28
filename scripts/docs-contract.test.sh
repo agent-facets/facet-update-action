@@ -3,53 +3,208 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readme="$repo_root/README.md"
-action="$repo_root/action.yml"
-example="$repo_root/examples/facet-update.yml"
+readme="${DOCS_CONTRACT_README:-$repo_root/README.md}"
+action="${DOCS_CONTRACT_ACTION:-$repo_root/action.yml}"
+example="${DOCS_CONTRACT_EXAMPLE:-$repo_root/examples/facet-update.yml}"
+workflow="${DOCS_CONTRACT_WORKFLOW:-$repo_root/.github/workflows/test.yml}"
 
 fail() { echo "docs contract: $*" >&2; exit 1; }
 
-section() {
-  local heading="$1"
-  awk -v heading="## $heading" '$0 == heading { found = 1; next } found && /^## / { exit } found { print } END { if (!found) exit 1 }' "$readme"
+ruby -ryaml - "$readme" "$action" "$example" "$workflow" <<'RUBY' || fail 'semantic README/YAML contract differs'
+readme_path, action_path, example_path, workflow_path = ARGV
+readme = File.read(readme_path)
+action = YAML.load_file(action_path)
+example = YAML.load_file(example_path)
+workflow = File.read(workflow_path)
+
+def reject(message)
+  warn "docs contract: #{message}"
+  exit 1
+end
+
+def section(document, heading)
+  match = document.match(/^## #{Regexp.escape(heading)}\n(?<body>.*?)(?=^## |\z)/m)
+  reject("missing README section: #{heading}") unless match
+  match[:body]
+end
+
+def require_claim(body, heading, claim, literal)
+  reject("#{heading} missing claim: #{claim}") unless body.include?(literal)
+end
+
+def fenced_blocks(body, language)
+  body.scan(/^```#{Regexp.escape(language)}\n(.*?)^```$/m).flatten
+end
+
+def yaml_blocks(document, heading)
+  blocks = fenced_blocks(section(document, heading), 'yaml')
+  reject("#{heading} missing fenced YAML example") if blocks.empty?
+  blocks.map { |block| YAML.safe_load(block, aliases: false) }
+end
+
+def table_rows(body)
+  rows = body.lines.each_with_object([]) do |line, found|
+    next unless line.start_with?('|')
+    cells = line.split('|')[1...-1].map { |cell| cell.strip }
+    next if cells.empty? || cells.all? { |cell| cell.match?(/\A-+\z/) }
+    found << cells
+  end
+  rows.drop(1)
+end
+
+def normalized_cell(value)
+  value.to_s.sub(/\A`/, '').sub(/`\z/, '')
+end
+
+inputs = action.fetch('inputs')
+outputs = action.fetch('outputs')
+fenced_blocks(readme, 'yaml').each_with_index do |block, index|
+  YAML.safe_load(block, aliases: false)
+rescue Psych::SyntaxError => error
+  reject("README fenced YAML example #{index + 1} is invalid: #{error.message.lines.first.strip}")
+end
+input_rows = table_rows(section(readme, 'Inputs')).to_h do |row|
+  [normalized_cell(row.fetch(0)), normalized_cell(row.fetch(1))]
+end
+output_rows = table_rows(section(readme, 'Outputs')).to_h do |row|
+  [normalized_cell(row.fetch(0)), row.fetch(1)]
+end
+
+reject('README input names differ from action.yml') unless input_rows.keys.sort == inputs.keys.sort
+reject('README output names differ from action.yml') unless output_rows.keys.sort == outputs.keys.sort
+
+display_default = lambda do |name, value|
+  return 'repo default' if name == 'base' && value.to_s.empty?
+  return 'none' if name == 'labels' && value.to_s.empty?
+  return 'github.token' if name == 'token' && value == '${{ github.token }}'
+  value.to_s
+end
+inputs.each do |name, definition|
+  expected = display_default.call(name, definition.fetch('default'))
+  reject("Inputs default #{name} differs from action.yml") unless input_rows.fetch(name) == expected
+end
+outputs.each do |name, definition|
+  expected_value = "${{ steps.update.outputs.#{name} }}"
+  reject("action.yml output #{name} wiring differs") unless definition.fetch('value') == expected_value
+end
+reject('Outputs updated semantics differ') unless output_rows.fetch('updated').include?('non-dry-run update changed at least one facet') && output_rows.fetch('updated').include?('dry runs always report `"false"`')
+reject('Outputs count semantics differ') unless output_rows.fetch('count').include?('upgrades, downgrades, additions, and removals') && output_rows.fetch('count').include?('not a proposed-change count')
+reject('Outputs pr-url semantics differ') unless output_rows.fetch('pr-url').include?('opened or refreshed') && output_rows.fetch('pr-url').include?('empty when none was')
+
+quickstart = yaml_blocks(readme, 'Quickstart').fetch(0)
+quickstart_steps = quickstart.dig('jobs', 'update', 'steps') || []
+quickstart_action = quickstart_steps.find { |step| step['uses']&.start_with?('agent-facets/facet-update-action@') }
+reject('Quickstart action step missing') unless quickstart_action
+reject('Quickstart action ref must be exactly @v1') unless quickstart_action['uses'] == 'agent-facets/facet-update-action@v1'
+reject('Quickstart CLI pin differs from action.yml') unless quickstart_action.dig('with', 'cli-version').to_s == inputs.dig('cli-version', 'default').to_s
+reject('Quickstart contents permission must be write') unless quickstart.dig('permissions', 'contents') == 'write'
+reject('Quickstart pull-requests permission must be write') unless quickstart.dig('permissions', 'pull-requests') == 'write'
+
+def assert_branch_concurrency(workflow, action_default, label)
+  action_step = workflow.dig('jobs', 'update', 'steps')&.find { |step| step['uses'] == 'agent-facets/facet-update-action@v1' }
+  reject("#{label} action step must use exactly @v1") unless action_step
+  branch = action_step.dig('with', 'branch') || action_default
+  group = workflow.dig('concurrency', 'group')
+  prefix = 'facet-update-${{ github.repository }}-'
+  reject("#{label} concurrency must start with repository prefix") unless group&.start_with?(prefix)
+  reject("#{label} branch must equal concurrency suffix") unless branch == group.delete_prefix(prefix)
+  reject("#{label} must not cancel an in-progress update") unless workflow.dig('concurrency', 'cancel-in-progress') == false
+  action_step
+end
+
+quickstart_action = assert_branch_concurrency(quickstart, inputs.dig('branch', 'default'), 'Quickstart')
+example_action = assert_branch_concurrency(example, inputs.dig('branch', 'default'), 'standalone example')
+reject('standalone example CLI pin differs from action.yml') unless example_action.dig('with', 'cli-version').to_s == inputs.dig('cli-version', 'default').to_s
+
+custom_branch = yaml_blocks(readme, 'Update branch').fetch(0)
+assert_branch_concurrency(custom_branch, inputs.dig('branch', 'default'), 'custom-branch example')
+
+credential_example = yaml_blocks(readme, 'Permissions').fetch(0)
+checkout_step = credential_example.find { |step| step['uses'] == 'actions/checkout@v4' }
+credential_action = credential_example.find { |step| step['uses'] == 'agent-facets/facet-update-action@v1' }
+reject('Permissions custom credential example missing checkout') unless checkout_step
+reject('Permissions custom credential example missing action') unless credential_action
+checkout_token = checkout_step.dig('with', 'token')
+action_token = credential_action.dig('with', 'token')
+reject('Permissions custom credential must be supplied to checkout and action') unless checkout_token == '${{ secrets.FACET_UPDATE_TOKEN }}' && action_token == checkout_token
+
+log_literal = workflow[/printf '([^']*)' > \/tmp\/dry-run-log\.expected/, 1]
+output_literal = workflow[/printf '([^']*)' > \/tmp\/dry-run\.expected/, 1]
+reject('authoritative workflow dry-run assertions missing') unless log_literal && output_literal
+expected_dry_run = (log_literal + output_literal).gsub('\\n', "\n").sub(/\n\z/, '')
+output_text_blocks = fenced_blocks(section(readme, 'Outputs'), 'text')
+reject('Outputs missing exact workflow-sourced four-line dry-run result') unless output_text_blocks == [expected_dry_run + "\n"]
+
+requirements = section(readme, 'Requirements')
+require_claim(requirements, 'Requirements', 'clean tree is insufficient without tracked facets.lock', 'The action rejects a missing, ignored, or untracked lockfile: a clean working tree alone is not evidence that the lockfile records the proposed versions.')
+require_claim(requirements, 'Requirements', 'hosted Ubuntu runner and tool assumptions', 'GitHub-hosted Ubuntu runner with Bash, Git, Node/npm (`npx`), and the GitHub CLI available')
+require_claim(requirements, 'Requirements', 'network access to GitHub and npm', 'outbound network access to GitHub (checkout, push, and pull-request API calls) and the npm registry')
+
+update_branch = section(readme, 'Update branch')
+require_claim(update_branch, 'Update branch', 'explicit lease uses the fetched tip', 'uses an explicit `--force-with-lease` against the fetched tip')
+require_claim(update_branch, 'Update branch', 'losing concurrent run refuses to push', 'the losing run refuses to push; it does not overwrite the winner')
+require_claim(update_branch, 'Update branch', 'bot-tip provenance check refuses replacement', 'If the existing tip was not made by `github-actions[bot]`, it also refuses to replace it.')
+require_claim(update_branch, 'Update branch', 'provenance is structural and non-cryptographic', 'These are structural provenance checks for a trusted repository, not cryptographic proof of who authored a commit and not a security boundary against a repository attacker.')
+require_claim(update_branch, 'Update branch', 'custom branch and concurrency suffix must agree', 'change the last segment of `concurrency.group` to the same literal')
+require_claim(update_branch, 'Update branch', 'closed PR recurrence creates a new PR', 'A closed historical pull request is not reused: the next update creates a new PR.')
+require_claim(update_branch, 'Update branch', 'sole matching open PR is refreshed', 'One matching open PR is refreshed as the branch advances.')
+require_claim(update_branch, 'Update branch', 'open-pr false cannot refresh an existing branch', '`open-pr: false` can create an absent update branch, but it cannot refresh an existing update branch')
+
+permissions = section(readme, 'Permissions')
+require_claim(permissions, 'Permissions', 'contents write permission', '`contents: write` to push')
+require_claim(permissions, 'Permissions', 'pull-requests write permission', '`pull-requests: write` to create or refresh the pull request')
+require_claim(permissions, 'Permissions', 'token permissions primary documentation', 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token')
+require_claim(permissions, 'Permissions', 'Actions-created-PR repository setting', '[Allow GitHub Actions to create and approve pull requests](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#preventing-github-actions-from-creating-or-approving-pull-requests)')
+require_claim(permissions, 'Permissions', 'pr-author validates ownership and defaults to the bot', '`pr-author` is an assertion, not a way to choose an identity: the created or refreshed PR must be owned by that login (default `github-actions[bot]`) or the action fails.')
+require_claim(permissions, 'Permissions', 'default-token checks require approval', 'The default `GITHUB_TOKEN` creates PR events in GitHub\'s approval-required workflow state, so downstream checks do not begin automatically.')
+require_claim(permissions, 'Permissions', 'App or PAT checks can begin automatically', 'An App installation token or PAT can create events that start checks automatically, subject to your repository settings.')
+
+supply_chain = section(readme, 'Supply chain')
+require_claim(supply_chain, 'Supply chain', 'action and CLI are both supply-chain pins', 'Pin both executable dependencies: use an action SHA when your policy requires the strongest pin, and set `cli-version: \'0.33.1\'`')
+require_claim(supply_chain, 'Supply chain', 'CLI and install scripts execute with job credentials', 'that version and its install scripts execute with the job\'s credentials')
+
+pinning_rows = table_rows(section(readme, 'Pinning')).to_h { |row| [normalized_cell(row.fetch(0)), row.fetch(1)] }
+reject('Pinning references must be distinct SHA, v1.0.0, and v1 rows') unless pinning_rows.keys == ['Full commit SHA', 'v1.0.0', 'v1']
+reject('Pinning missing strongest full-SHA policy') unless pinning_rows.fetch('Full commit SHA').include?('Strongest action pin')
+reject('Pinning missing immutable v1.0.0 policy') unless pinning_rows.fetch('v1.0.0').include?('immutable release tag')
+reject('Pinning missing movable v1 policy') unless pinning_rows.fetch('v1').include?('it can move') && pinning_rows.fetch('v1').include?("repository's immutable-release policy")
+RUBY
+
+run_mutation_probe() {
+  local label="$1" expected="$2" mutation="$3"
+  local probe_readme="$probe_dir/$label.md" probe_output="$probe_dir/$label.out"
+  cp "$readme" "$probe_readme"
+  ruby -e "$mutation" "$probe_readme"
+  if DOCS_CONTRACT_README="$probe_readme" DOCS_CONTRACT_SKIP_PROBES=1 bash "$0" >"$probe_output" 2>&1; then
+    fail "mutation probe unexpectedly passed: $label"
+  fi
+  rg -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
+  echo "docs contract mutation: $label rejected"
 }
 
-require_section_claim() {
-  local heading="$1" claim="$2" pattern="$3"
-  section "$heading" | rg -q -- "$pattern" || fail "$heading missing claim: $claim"
-}
-
-ruby -ryaml -e '
-  action = YAML.load_file(ARGV[0]); example = YAML.load_file(ARGV[1])
-  { "cli-version" => "0.33.1", "branch" => "facet-updates", "pr-author" => "github-actions[bot]" }.each { |key, value| abort("action default #{key} differs") unless action.dig("inputs", key, "default").to_s == value }
-  abort("action updated output differs") unless action.dig("outputs", "updated", "value") == "${{ steps.update.outputs.updated }}"
-  abort("action count output differs") unless action.dig("outputs", "count", "value") == "${{ steps.update.outputs.count }}"
-  abort("example concurrency must use repository plus destination branch") unless example.dig("concurrency", "group") == "facet-update-${{ github.repository }}-facet-updates"
-  abort("example must keep active updates") unless example.dig("concurrency", "cancel-in-progress") == false
-  steps = example.dig("jobs", "update", "steps")
-  action_step = steps.find { |step| step["uses"] == "agent-facets/facet-update-action@v1" }
-  abort("example must use action @v1") unless action_step
-  abort("example CLI pin differs") unless action_step.dig("with", "cli-version").to_s == "0.33.1"
-' "$action" "$example" || fail "YAML defaults or example wiring differs"
-
-expected_dry_run=$'facet-update: updated=false count=0\nupdated=false\ncount=0\nsummary='
-actual_dry_run="$(awk '/^```text$/{inside=1; next} inside && /^```$/{exit} inside{print}' < <(section Outputs))"
-[[ "$actual_dry_run" == "$expected_dry_run" ]] || fail 'Outputs missing exact four-line dry-run result'
-
-require_section_claim Requirements 'hosted Ubuntu runner and tool assumptions' 'GitHub-hosted Ubuntu runner with Bash, Git, Node/npm \(`npx`\), and the GitHub CLI'
-require_section_claim Requirements 'network access to GitHub and npm' 'outbound network access to GitHub.*npm registry'
-require_section_claim Permissions 'repository Actions PR setting' 'Actions settings must also allow GitHub Actions to create pull requests'
-require_section_claim Permissions 'pr-author validates ownership' '`pr-author` is an assertion'
-require_section_claim Permissions 'default-token checks require approval' 'approval-required workflow state'
-require_section_claim Permissions 'App or PAT checks can begin automatically' 'App installation token or PAT can create events that start checks automatically'
-require_section_claim Permissions 'custom credential reaches checkout and action' 'secrets.FACET_UPDATE_TOKEN'
-require_section_claim 'Supply chain' 'CLI is exactly pinned' "cli-version: '0.33.1'"
-require_section_claim 'Supply chain' 'action and CLI are supply-chain pins' 'Pin both executable dependencies'
-require_section_claim 'Update branch' 'structural provenance is non-cryptographic' 'not cryptographic proof'
-require_section_claim 'Update branch' 'existing branch cannot refresh with open-pr false' 'cannot refresh an existing update branch'
-require_section_claim 'Update branch' 'branch and concurrency suffix must match' 'last segment of `concurrency.group` to the same literal'
-require_section_claim Pinning 'full SHA is strongest action pin' 'Full commit SHA'
-require_section_claim Pinning 'immutable patch tag policy' '`v1.0.0`'
-require_section_claim Pinning 'movable major tag policy' '`v1`'
+if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/docs-contract.XXXXXX")"
+  trap 'rm -rf "$probe_dir"' EXIT
+  run_mutation_probe missing-tracked-lock 'Requirements missing claim: clean tree is insufficient without tracked facets.lock' '
+    path = ARGV.fetch(0); text = File.read(path)
+    claim = "The action rejects a missing, ignored, or untracked lockfile: a clean working tree alone is not evidence that the lockfile records the proposed versions."
+    abort "mutation anchor missing" unless text.include?(claim)
+    File.write(path, text.sub(claim, ""))
+  '
+  run_mutation_probe misplaced-actions-setting 'Permissions missing claim: Actions-created-PR repository setting' '
+    path = ARGV.fetch(0); text = File.read(path)
+    claim = "Repository or organization Actions settings must also enable [Allow GitHub Actions to create and approve pull requests](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#preventing-github-actions-from-creating-or-approving-pull-requests)."
+    abort "mutation anchor missing" unless text.include?(claim)
+    text = text.sub(claim, "")
+    text = text.sub("## Requirements\n", "## Requirements\n\n#{claim}\n")
+    File.write(path, text)
+  '
+  run_mutation_probe overlapping-major-tag 'Pinning references must be distinct SHA, v1.0.0, and v1 rows' '
+    path = ARGV.fetch(0); text = File.read(path)
+    row = "| `v1` | Convenient major-line tag; it can move to compatible releases and therefore depends on the repository\x27s immutable-release policy. |"
+    abort "mutation anchor missing" unless text.include?(row)
+    File.write(path, text.sub(row, "| `v1.0.0` | Duplicate patch row. |"))
+  '
+fi
 
 echo 'docs contract: PASS'
