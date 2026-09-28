@@ -15,6 +15,9 @@ inputs:
     description: Version of the agent-facets CLI to run.
     required: false
     default: 0.33.1
+  adapter:
+    description: Exact version of a first-party materialization adapter (claude-code, opencode, or codex), as name@M.N.P.
+    required: true
   working-directory:
     description: Directory containing facets.json.
     required: false
@@ -76,6 +79,7 @@ runs:
       env:
         FACET_STRATEGY: ${{ inputs.strategy }}
         FACET_CLI_VERSION: ${{ inputs.cli-version }}
+        FACET_ADAPTER: ${{ inputs.adapter }}
         FACET_WORKING_DIR: ${{ inputs.working-directory }}
         FACET_DRY_RUN: ${{ inputs.dry-run }}
         BRANCH: ${{ inputs.branch }}

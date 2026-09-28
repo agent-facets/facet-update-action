@@ -7,15 +7,17 @@ readme="${DOCS_CONTRACT_README:-$repo_root/README.md}"
 action="${DOCS_CONTRACT_ACTION:-$repo_root/action.yml}"
 example="${DOCS_CONTRACT_EXAMPLE:-$repo_root/examples/facet-update.yml}"
 workflow="${DOCS_CONTRACT_WORKFLOW:-$repo_root/.github/workflows/test.yml}"
+publisher="${DOCS_CONTRACT_PUBLISHER:-$repo_root/scripts/publish-update.sh}"
 
 fail() { echo "docs contract: $*" >&2; exit 1; }
 
-ruby -ryaml - "$readme" "$action" "$example" "$workflow" <<'RUBY' || fail 'semantic README/YAML contract differs'
-readme_path, action_path, example_path, workflow_path = ARGV
+ruby -ryaml - "$readme" "$action" "$example" "$workflow" "$publisher" <<'RUBY' || fail 'semantic README/YAML contract differs'
+readme_path, action_path, example_path, workflow_path, publisher_path = ARGV
 readme = File.read(readme_path)
 action = YAML.load_file(action_path)
 example = YAML.load_file(example_path)
 workflow = YAML.load_file(workflow_path)
+publisher = File.read(publisher_path)
 
 def reject(message)
   warn "docs contract: #{message}"
@@ -57,6 +59,18 @@ def normalized_cell(value)
 end
 
 inputs = action.fetch('inputs')
+adapter_input = inputs.fetch('adapter')
+reject('action adapter input must be required without a default') unless adapter_input['required'] == true && !adapter_input.key?('default')
+action_env = action.fetch('runs').fetch('steps').fetch(0).fetch('env')
+reject('action adapter env wiring missing') unless action_env['FACET_ADAPTER'] == '${{ inputs.adapter }}'
+reject('publisher adapter env read missing') unless publisher.include?('ADAPTER="${FACET_ADAPTER-}"')
+reject('publisher adapter validation must precede repository discovery') unless
+  publisher.index('case "${ADAPTER%%@*}"') && publisher.index('[[ "$ADAPTER" =~') &&
+  publisher.index('[[ "$ADAPTER" =~') < publisher.index('REPO_ROOT="$(git rev-parse --show-toplevel')
+bootstrap = 'npx --yes "agent-facets@${CLI_VERSION}" adapter add "$ADAPTER" < /dev/null'
+update = 'bash "$(dirname "$0")/facet-update.sh"'
+reject('publisher must bootstrap pinned adapter once before update') unless
+  publisher.scan(bootstrap).length == 1 && publisher.index(bootstrap) < publisher.index(update)
 outputs = action.fetch('outputs')
 fenced_blocks(readme, 'yaml').each_with_index do |block, index|
   YAML.safe_load(block, aliases: false)
@@ -80,7 +94,7 @@ display_default = lambda do |name, value|
   value.to_s
 end
 inputs.each do |name, definition|
-  expected = display_default.call(name, definition.fetch('default'))
+  expected = definition.key?('default') ? display_default.call(name, definition.fetch('default')) : 'required'
   reject("Inputs default #{name} differs from action.yml") unless input_rows.fetch(name) == expected
 end
 outputs.each do |name, definition|
@@ -117,7 +131,7 @@ example_action = assert_branch_concurrency(example, inputs.dig('branch', 'defaul
 reject('standalone example CLI pin differs from action.yml') unless example_action.dig('with', 'cli-version').to_s == inputs.dig('cli-version', 'default').to_s
 
 custom_branch = yaml_blocks(readme, 'Update branch').fetch(0)
-assert_branch_concurrency(custom_branch, inputs.dig('branch', 'default'), 'custom-branch example')
+custom_branch_action = assert_branch_concurrency(custom_branch, inputs.dig('branch', 'default'), 'custom-branch example')
 
 credential_example = yaml_blocks(readme, 'Permissions').fetch(0)
 checkout_step = credential_example.find { |step| step['uses'] == 'actions/checkout@v7' }
@@ -128,12 +142,22 @@ checkout_token = checkout_step.dig('with', 'token')
 action_token = credential_action.dig('with', 'token')
 reject('Permissions custom credential must be supplied to checkout and action') unless checkout_token == '${{ secrets.FACET_UPDATE_TOKEN }}' && action_token == checkout_token
 
+adapter_pattern = /\A(?:claude-code|opencode|codex)@(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z/
+{
+  'Quickstart' => quickstart_action,
+  'custom-branch example' => custom_branch_action,
+  'Permissions custom credential example' => credential_action,
+  'standalone example' => example_action
+}.each do |label, step|
+  reject("#{label} must pin an exact first-party adapter") unless step.dig('with', 'adapter').to_s.match?(adapter_pattern)
+end
+
 published_steps = workflow.fetch('jobs').fetch('published-cli').fetch('steps')
 def require_published_adapter_before_install(steps, step_name, label)
   install_step = steps.find { |step| step['name'] == step_name }
   reject("#{label} install step missing") unless install_step
   lines = install_step.fetch('run').lines.map(&:strip)
-  adapter = 'npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null'
+  adapter = 'npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex@0.9.0 < /dev/null'
   install = 'npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null'
   reject("#{label} must configure pinned Codex adapter before install") unless
     lines.count(adapter) == 1 && lines.count(install) == 1 && lines.index(adapter) < lines.index(install)
@@ -181,11 +205,23 @@ reject('action CI fixture commit missing') unless fixture_run.include?("git -c c
 reject('action CI fixture must be clean') unless fixture_run.include?('[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]')
 action_step = action_steps.find { |step| step['uses'] == './' }
 reject('action CI composite invocation missing') unless action_step
+home = '${{ runner.temp }}/facet-update-action-${{ github.run_id }}-${{ github.run_attempt }}'
+pre_step = action_steps.find { |step| step['name'] == 'Assert action adapter home starts absent' }
+reject('action CI missing pre-action adapter-home absence assertion') unless pre_step
+reject('action CI adapter home must be unique and shared across assertions and invocation') unless
+  [pre_step, action_step, action_steps.find { |step| step['name'] == 'Dry-run reports no change and writes nothing' }].all? { |step| step && step.dig('env', 'FACET_DIR') == home }
+reject('action CI must assert adapter home absent without preseed') unless pre_step.fetch('run').lines.map(&:strip) == ['set -euo pipefail', 'test ! -e "$FACET_DIR"']
+reject('action CI must assert absence before composite invocation') unless action_steps.index(pre_step) < action_steps.index(action_step)
+reject('action CI must not preseed the action adapter home') if action_steps[0...action_steps.index(pre_step)].any? { |step| step.to_s.include?('FACET_DIR') || step.to_s.include?(home) }
+reject('action CI must select exact Codex adapter') unless action_step.dig('with', 'adapter') == 'codex@0.9.0'
 reject('action CI must select fixture remote base') unless action_step.dig('with', 'base') == 'ci-fixture-base'
 reject('action CI must select tracked fixture directory') unless action_step.dig('with', 'working-directory') == 'fixture'
 reject('action CI must run dry-run') unless action_step.dig('with', 'dry-run').to_s == 'true'
 output_step = action_steps.find { |step| step['name'] == 'Dry-run reports no change and writes nothing' }
 reject('action CI output assertion missing') unless output_step
+reject('action CI must assert selected adapter presence afterward') unless
+  action_steps.index(output_step) > action_steps.index(action_step) &&
+  output_step.fetch('run').include?('test -d "$FACET_DIR/adapters/codex"')
 reject('action CI must not assert undeclared summary output') if output_step.fetch('env').key?('SUMMARY') || output_step.fetch('run').include?('$SUMMARY')
 
 output_literal = dry_run_lines.find { |line| line.start_with?("printf '") && line.end_with?(' > /tmp/dry-run.expected') }
@@ -222,8 +258,9 @@ require_claim(permissions, 'Permissions', 'default-token checks require approval
 require_claim(permissions, 'Permissions', 'App or PAT checks can begin automatically', 'An App installation token or PAT can create events that start checks automatically, subject to your repository settings.')
 
 supply_chain = section(readme, 'Supply chain')
-require_claim(supply_chain, 'Supply chain', 'action and CLI are both supply-chain pins', 'Pin both executable dependencies: use an action SHA when your policy requires the strongest pin, and set `cli-version: \'0.33.1\'`')
-require_claim(supply_chain, 'Supply chain', 'CLI and install scripts execute with job credentials', 'that version and its install scripts execute with the job\'s credentials')
+require_claim(supply_chain, 'Supply chain', 'action, CLI, and adapter are separate pins', 'Pin the action and both executable packages separately')
+require_claim(supply_chain, 'Supply chain', 'adapter exact pin example', '`adapter: codex@0.9.0`')
+require_claim(supply_chain, 'Supply chain', 'CLI and adapter install scripts execute with job credentials', 'Both npm packages and their install scripts execute with the job\'s credentials')
 
 pinning_rows = table_rows(section(readme, 'Pinning')).to_h { |row| [normalized_cell(row.fetch(0)), row.fetch(1)] }
 reject('Pinning references must be distinct SHA, v1.0.0, and v1 rows') unless pinning_rows.keys == ['Full commit SHA', 'v1.0.0', 'v1']
@@ -250,6 +287,18 @@ run_workflow_mutation_probe() {
   cp "$workflow" "$probe_workflow"
   ruby -e "$mutation" "$probe_workflow"
   if DOCS_CONTRACT_WORKFLOW="$probe_workflow" DOCS_CONTRACT_SKIP_PROBES=1 bash "$0" >"$probe_output" 2>&1; then
+    fail "mutation probe unexpectedly passed: $label"
+  fi
+  grep -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
+  echo "docs contract mutation: $label rejected"
+}
+
+run_artifact_mutation_probe() {
+  local label="$1" expected="$2" source="$3" override="$4" mutation="$5"
+  local probe_file="$probe_dir/$label" probe_output="$probe_dir/$label.out"
+  cp "$source" "$probe_file"
+  ruby -e "$mutation" "$probe_file"
+  if env "$override=$probe_file" DOCS_CONTRACT_SKIP_PROBES=1 bash "$0" > "$probe_output" 2>&1; then
     fail "mutation probe unexpectedly passed: $label"
   fi
   grep -Fq -- "$expected" "$probe_output" || fail "mutation probe failed for the wrong reason: $label"
@@ -285,6 +334,59 @@ if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
     abort "mutation anchor missing" unless text.include?(anchor)
     File.write(path, text.sub(anchor, "The console contains only the result line"))
   '
+  for index in 0 1 2; do
+    case "$index" in
+      0) label=quickstart ;;
+      1) label=custom-branch ;;
+      2) label=credentials ;;
+    esac
+    run_mutation_probe "missing-$label-adapter" 'must pin an exact first-party adapter' "
+      path = ARGV.fetch(0); text = File.read(path)
+      anchor = 'adapter: codex@0.9.0'
+      positions = text.enum_for(:scan, anchor).map { Regexp.last_match.begin(0) }
+      abort 'mutation anchor count differs' unless positions.length == 4
+      offset = positions.fetch($index)
+      File.write(path, text[0...offset] + 'adapter: codex@latest' + text[(offset + anchor.length)..])
+    "
+  done
+  run_artifact_mutation_probe floating-example-adapter 'standalone example must pin an exact first-party adapter' "$example" DOCS_CONTRACT_EXAMPLE '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "adapter: codex@0.9.0"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "adapter: codex@latest"))
+  '
+  run_artifact_mutation_probe missing-action-input 'action adapter input must be required without a default' "$action" DOCS_CONTRACT_ACTION '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "    required: true\n"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "    required: false\n"))
+  '
+  run_artifact_mutation_probe missing-action-env 'action adapter env wiring missing' "$action" DOCS_CONTRACT_ACTION '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{        FACET_ADAPTER: ${{ inputs.adapter }}}
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, ""))
+  '
+  run_artifact_mutation_probe missing-publisher-bootstrap 'publisher must bootstrap pinned adapter once before update' "$publisher" DOCS_CONTRACT_PUBLISHER '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{npx --yes "agent-facets@${CLI_VERSION}" adapter add "$ADAPTER" < /dev/null}
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, ""))
+  '
+  run_artifact_mutation_probe late-publisher-bootstrap 'publisher must bootstrap pinned adapter once before update' "$publisher" DOCS_CONTRACT_PUBLISHER '
+    path = ARGV.fetch(0); text = File.read(path)
+    bootstrap = %q{npx --yes "agent-facets@${CLI_VERSION}" adapter add "$ADAPTER" < /dev/null}
+    update = %q{bash "$(dirname "$0")/facet-update.sh"}
+    abort "mutation anchor missing" unless text.include?(bootstrap) && text.include?(update)
+    text = text.sub(bootstrap, "")
+    File.write(path, text.sub(update, "#{update}\n#{bootstrap}"))
+  '
+  run_artifact_mutation_probe missing-publisher-validation 'publisher adapter validation must precede repository discovery' "$publisher" DOCS_CONTRACT_PUBLISHER '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{[[ "$ADAPTER" =~}
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, "[[ \"DISABLED_ADAPTER\" =~"))
+  '
   run_workflow_mutation_probe missing-final-result-check 'published CLI dry-run missing final console line' '
     path = ARGV.fetch(0); text = File.read(path)
     anchor = "tail -n 1 /tmp/dry-run.log"
@@ -307,16 +409,76 @@ if [[ "${DOCS_CONTRACT_SKIP_PROBES:-0}" != 1 ]]; then
   '
   run_workflow_mutation_probe missing-published-adapter 'published CLI fixture must configure pinned Codex adapter before install' '
     path = ARGV.fetch(0); text = File.read(path)
-    anchor = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null}
+    anchor = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex@0.9.0 < /dev/null}
     abort "mutation anchor count differs" unless text.scan(anchor).length == 2
     File.write(path, text.sub(anchor, ""))
   '
+  run_workflow_mutation_probe late-published-adapter 'published CLI fixture must configure pinned Codex adapter before install' '
+    path = ARGV.fetch(0); text = File.read(path)
+    adapter = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex@0.9.0 < /dev/null}
+    install = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null}
+    pair = "#{adapter}\n          #{install}"
+    abort "mutation anchor count differs" unless text.scan(pair).length == 2
+    File.write(path, text.sub(pair, "#{install}\n          #{adapter}"))
+  '
   run_workflow_mutation_probe missing-action-adapter 'action CI fixture must configure pinned Codex adapter before install' '
     path = ARGV.fetch(0); text = File.read(path)
-    anchor = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null}
+    anchor = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex@0.9.0 < /dev/null}
     abort "mutation anchor count differs" unless text.scan(anchor).length == 2
     offset = text.rindex(anchor)
     File.write(path, text[0...offset] + text[(offset + anchor.length)..])
+  '
+  run_workflow_mutation_probe late-action-fixture-adapter 'action CI fixture must configure pinned Codex adapter before install' '
+    path = ARGV.fetch(0); text = File.read(path)
+    adapter = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex@0.9.0 < /dev/null}
+    install = %q{npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null}
+    pair = "#{adapter}\n          #{install}"
+    abort "mutation anchor count differs" unless text.scan(pair).length == 2
+    offset = text.rindex(pair)
+    File.write(path, text[0...offset] + "#{install}\n          #{adapter}" + text[(offset + pair.length)..])
+  '
+  run_workflow_mutation_probe floating-published-adapter 'published CLI fixture must configure pinned Codex adapter before install' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{adapter add codex@0.9.0}
+    abort "mutation anchor count differs" unless text.scan(anchor).length == 2
+    File.write(path, text.sub(anchor, "adapter add codex@latest"))
+  '
+  run_workflow_mutation_probe floating-action-fixture-adapter 'action CI fixture must configure pinned Codex adapter before install' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{adapter add codex@0.9.0}
+    abort "mutation anchor count differs" unless text.scan(anchor).length == 2
+    offset = text.rindex(anchor)
+    File.write(path, text[0...offset] + "adapter add codex" + text[(offset + anchor.length)..])
+  '
+  run_workflow_mutation_probe missing-action-input 'action CI must select exact Codex adapter' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = "          adapter: codex@0.9.0\n"
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, ""))
+  '
+  run_workflow_mutation_probe missing-pre-action-absence 'action CI must assert adapter home absent without preseed' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{test ! -e "$FACET_DIR"}
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, %q{test -e "$FACET_DIR"}))
+  '
+  run_workflow_mutation_probe preseeded-action-home 'action CI must assert adapter home absent without preseed' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{test ! -e "$FACET_DIR"}
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, %Q{mkdir -p "$FACET_DIR/adapters/codex"\n          #{anchor}}))
+  '
+  run_workflow_mutation_probe missing-post-action-presence 'action CI must assert selected adapter presence afterward' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{test -d "$FACET_DIR/adapters/codex"}
+    abort "mutation anchor missing" unless text.include?(anchor)
+    File.write(path, text.sub(anchor, ""))
+  '
+  run_workflow_mutation_probe wrong-action-home 'action CI adapter home must be unique and shared across assertions and invocation' '
+    path = ARGV.fetch(0); text = File.read(path)
+    anchor = %q{FACET_DIR: ${{ runner.temp }}/facet-update-action-${{ github.run_id }}-${{ github.run_attempt }}}
+    abort "mutation anchor count differs" unless text.scan(anchor).length == 3
+    File.write(path, text.sub(anchor, "FACET_DIR: /tmp/preseeded-home"))
   '
   run_workflow_mutation_probe untracked-action-fixture 'action CI fixture setup missing git add -A -- fixture' '
     path = ARGV.fetch(0); text = File.read(path)

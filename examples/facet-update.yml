@@ -24,6 +24,7 @@ jobs:
 
       - uses: agent-facets/facet-update-action@v1
         with:
+          adapter: codex@0.9.0
           strategy: latest
           cli-version: '0.33.1'
           labels: facets,dependencies

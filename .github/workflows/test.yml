@@ -56,7 +56,7 @@ jobs:
           git config user.email t@t
           git config user.name t
           printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
-          npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null
+          npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex@0.9.0 < /dev/null
           npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null
           test -f facets.lock
           git add -A
@@ -131,7 +131,7 @@ jobs:
           git config user.name 'CI fixture'
           mkdir -p fixture && cd fixture
           printf '{ "facets": { "cowsay": "1.0.0" }, "manifestVersion": 0.1 }\n' > facets.json
-          npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex < /dev/null
+          npx --yes "agent-facets@${FACET_CLI_PIN}" adapter add codex@0.9.0 < /dev/null
           npx --yes "agent-facets@${FACET_CLI_PIN}" install --accept-mcp < /dev/null
           cd "$GITHUB_WORKSPACE"
           git add -A -- fixture
@@ -149,10 +149,20 @@ jobs:
           set -euo pipefail
           sha256sum fixture/facets.json fixture/facets.lock > /tmp/fixture.sha
 
+      - name: Assert action adapter home starts absent
+        env:
+          FACET_DIR: ${{ runner.temp }}/facet-update-action-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test ! -e "$FACET_DIR"
+
       - name: Run the action in dry-run
         id: dry
         uses: ./
+        env:
+          FACET_DIR: ${{ runner.temp }}/facet-update-action-${{ github.run_id }}-${{ github.run_attempt }}
         with:
+          adapter: codex@0.9.0
           working-directory: fixture
           base: ci-fixture-base
           strategy: latest
@@ -160,11 +170,13 @@ jobs:
 
       - name: Dry-run reports no change and writes nothing
         env:
+          FACET_DIR: ${{ runner.temp }}/facet-update-action-${{ github.run_id }}-${{ github.run_attempt }}
           UPDATED: ${{ steps.dry.outputs.updated }}
           COUNT: ${{ steps.dry.outputs.count }}
         run: |
           set -euo pipefail
           [ "$UPDATED" = "false" ] || { echo "dry-run reported updated=$UPDATED"; exit 1; }
           [ "$COUNT" = "0" ] || { echo "dry-run reported count=$COUNT"; exit 1; }
+          test -d "$FACET_DIR/adapters/codex"
           sha256sum --check --status /tmp/fixture.sha \
             || { echo "dry-run modified the fixture"; exit 1; }

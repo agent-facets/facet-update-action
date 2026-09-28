@@ -4,6 +4,7 @@ set -euo pipefail
 
 STRATEGY="${FACET_STRATEGY:-latest}"
 CLI_VERSION="${FACET_CLI_VERSION:-0.33.1}"
+ADAPTER="${FACET_ADAPTER-}"
 WORKING_DIR="${FACET_WORKING_DIR:-.}"
 DRY_RUN="${FACET_DRY_RUN:-false}"
 OUTPUT="${FACET_OUTPUT:-${GITHUB_OUTPUT:-}}"
@@ -30,6 +31,11 @@ case "$DRY_RUN" in true | false) ;; *) fail "dry-run must be 'true' or 'false', 
 case "$OPEN_PR" in true | false) ;; *) fail "open-pr must be 'true' or 'false', got '${OPEN_PR}'" ;; esac
 case "$STRATEGY" in latest | in-range) ;; *) fail "strategy must be 'latest' or 'in-range', got '${STRATEGY}'" ;; esac
 [[ "$CLI_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "invalid cli-version '${CLI_VERSION}'"
+case "${ADAPTER%%@*}" in
+  claude-code | opencode | codex) ;;
+  *) fail 'adapter must be claude-code, opencode, or codex at an exact M.N.P version' ;;
+esac
+[[ "$ADAPTER" =~ ^(claude-code|opencode|codex)@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'adapter must be claude-code, opencode, or codex at an exact M.N.P version'
 [[ "$PR_AUTHOR" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*(\[bot\])?$ ]] || fail "invalid pr-author '${PR_AUTHOR}'"
 [[ "$GITHUB_REPOSITORY_OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail "invalid repository owner"
 [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail "invalid repository"
@@ -190,6 +196,8 @@ fi
 git checkout -B "$BRANCH" "$BASE_SHA"
 git config user.name 'github-actions[bot]'
 git config user.email "$BOT_EMAIL"
+
+npx --yes "agent-facets@${CLI_VERSION}" adapter add "$ADAPTER" < /dev/null
 
 FACET_STRATEGY="$STRATEGY" \
 FACET_CLI_VERSION="$CLI_VERSION" \

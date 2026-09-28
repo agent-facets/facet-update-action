@@ -32,6 +32,16 @@ cat > "$FAKE_BIN/npx" <<'FAKE_NPX'
 #!/usr/bin/env bash
 set -euo pipefail
 [ -z "${SENTINEL_DIR:-}" ] || : > "$SENTINEL_DIR/npx"
+[ /dev/fd/0 -ef /dev/null ] || { echo 'fake-npx: stdin was not closed' >&2; exit 98; }
+printf '<%s>' "$@" >> "${FAKE_NPX_LOG:?}"
+printf '\n' >> "$FAKE_NPX_LOG"
+[ "${1:-}" = --yes ] && [ "${2:-}" = agent-facets@0.33.1 ] || exit 96
+if [ "${3:-}" = adapter ]; then
+  [ "$#" = 5 ] && [ "$4" = add ] && [ "$5" = "${FAKE_EXPECT_ADAPTER:-codex@0.9.0}" ] || exit 95
+  [ "${FAKE_BOOTSTRAP_FAIL:-0}" = 0 ] || exit 20
+  exit 0
+fi
+[ "${3:-}" = update ] || exit 94
 case "${FAKE_NPX_MODE:-change}" in
   fail) exit 19 ;;
   no-change) exit 0 ;;
@@ -112,6 +122,13 @@ cat > "$FAKE_BIN/git" <<'FAKE_GIT'
 #!/usr/bin/env bash
 set -euo pipefail
 git_args=("$@")
+if [ -n "${EARLY_GIT_SENTINEL_DIR:-}" ]; then
+  case "${1:-} ${2:-}" in
+    'rev-parse --show-toplevel') : > "$EARLY_GIT_SENTINEL_DIR/discovery" ;;
+    'fetch '*) : > "$EARLY_GIT_SENTINEL_DIR/fetch" ;;
+    'ls-remote '*) : > "$EARLY_GIT_SENTINEL_DIR/ls-remote" ;;
+  esac
+fi
 if [ "${FAKE_FETCH_FAIL:-0}" = 1 ] && [ "${1:-}" = fetch ]; then
   for argument in "$@"; do
     case "$argument" in
@@ -198,6 +215,7 @@ new_fixture() {
   "$REAL_GIT" --git-dir="$REMOTE" symbolic-ref HEAD refs/heads/main
   printf '[[]]\n' > "$FIXTURE/pr-list.json"
   : > "$FIXTURE/gh.log"
+  : > "$FIXTURE/npx.log"
 }
 
 fresh_clone() {
@@ -224,6 +242,7 @@ run_publish() {
       REAL_GIT="$REAL_GIT" \
       FACET_WORKING_DIR=project \
       FACET_CLI_VERSION=0.33.1 \
+      FACET_ADAPTER=codex@0.9.0 \
       FACET_STRATEGY=latest \
       FACET_DRY_RUN=false \
       FACET_OUTPUT="$FIXTURE/output" \
@@ -238,6 +257,7 @@ run_publish() {
       GITHUB_REPOSITORY_OWNER=acme \
       FAKE_PR_LIST="$FIXTURE/pr-list.json" \
       FAKE_GH_LOG="$FIXTURE/gh.log" \
+      FAKE_NPX_LOG="$FIXTURE/npx.log" \
       FAKE_EXPECT_BRANCH=facet-updates \
       FAKE_EXPECT_BASE=main \
       FAKE_CREATE_AUTHOR='github-actions[bot]' \
@@ -480,6 +500,44 @@ expect_input_rejected() {
   pass "input rejection before CLI/API/push: $label"
 }
 
+expect_adapter_rejected() {
+  local slug="$1" label="$2" value="$3"
+  new_fixture "adapter-$slug"
+  local clone sentinel
+  clone="$(fresh_clone caller)"
+  sentinel="$FIXTURE/sentinel"
+  mkdir -p "$sentinel"
+  if run_publish "$clone" 1 SENTINEL_DIR="$sentinel" EARLY_GIT_SENTINEL_DIR="$sentinel" "FACET_ADAPTER=$value" > "$FIXTURE/input.log" 2>&1; then
+    fail_test "$label unexpectedly succeeded"
+  fi
+  [ -z "$(ls -A "$sentinel")" ] || fail_test "$label reached repository discovery, fetch, ls-remote, CLI, API, or push"
+  [ ! -s "$FIXTURE/npx.log" ] || fail_test "$label reached npx"
+  [ ! -s "$FIXTURE/gh.log" ] || fail_test "$label reached GitHub API"
+  if "$REAL_GIT" --git-dir="$REMOTE" show-ref --verify --quiet refs/heads/facet-updates; then
+    fail_test "$label pushed"
+  fi
+  pass "adapter rejection before discovery/fetch/remote/CLI/API/push: $label"
+}
+
+expect_adapter_rejected empty 'empty adapter' ''
+expect_adapter_rejected unversioned 'unversioned adapter' codex
+expect_adapter_rejected floating-latest 'floating latest selector' codex@latest
+expect_adapter_rejected floating-range 'floating range selector' 'codex@^0.9.0'
+expect_adapter_rejected option 'option-like adapter' --prefix=/tmp
+expect_adapter_rejected newline 'newline adapter' $'codex@0.9.0\n--prefix=/tmp'
+expect_adapter_rejected unsupported 'unsupported adapter' custom@0.9.0
+expect_adapter_rejected injecting 'injecting adapter' "codex@0.9.0;touch $TEST_ROOT/injected"
+expect_adapter_rejected leading-zero 'noncanonical adapter version' codex@00.9.0
+
+for adapter_spec in claude-code@1.2.3 opencode@2.0.1; do
+  new_fixture "adapter-valid-${adapter_spec%@*}"
+  clone="$(fresh_clone caller)"
+  run_publish "$clone" 1 FACET_ADAPTER="$adapter_spec" FAKE_EXPECT_ADAPTER="$adapter_spec" FAKE_NPX_MODE=no-change > "$FIXTURE/run.log" 2>&1
+  printf '<--yes><agent-facets@0.33.1><adapter><add><%s>\n<--yes><agent-facets@0.33.1><update><--accept-mcp><--latest>\n' "$adapter_spec" > "$FIXTURE/expected-npx.log"
+  cmp "$FIXTURE/expected-npx.log" "$FIXTURE/npx.log" || fail_test "$adapter_spec bootstrap/update argv differ"
+  pass "exact first-party adapter accepted: $adapter_spec"
+done
+
 expect_input_rejected option-branch 'option-like branch' BRANCH=-danger
 expect_input_rejected option-base 'option-like base' BASE=-danger
 expect_input_rejected newline-branch 'newline branch' BRANCH=$'bad\nmain'
@@ -551,6 +609,9 @@ clone="$(fresh_clone caller)"
   "$REAL_GIT" commit -q -m feature
 )
 run_publish "$clone" 2 > "$FIXTURE/run.log" 2>&1
+printf '<--yes><agent-facets@0.33.1><adapter><add><codex@0.9.0>\n<--yes><agent-facets@0.33.1><update><--accept-mcp><--latest>\n' > "$FIXTURE/expected-npx.log"
+cmp "$FIXTURE/expected-npx.log" "$FIXTURE/npx.log" || fail_test 'bootstrap and update argv, order, or count differ'
+pass 'one pinned adapter bootstrap precedes one pinned update, both with closed stdin'
 tip="$(remote_tip facet-updates)"
 assert_eq "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse "$tip^")" "$(remote_tip main)" 'proposal parent'
 assert_contains "$FIXTURE/gh.log" 'api --method POST /repos/acme/widgets/pulls' 'create call'

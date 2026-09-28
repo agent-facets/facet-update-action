@@ -32,6 +32,7 @@ jobs:
       - uses: agent-facets/facet-update-action@v1
         with:
           cli-version: '0.33.1'
+          adapter: codex@0.9.0
 ```
 
 Both permissions are required; see [Permissions](#permissions). `workflow_dispatch` lets you test the action without waiting for the schedule.
@@ -40,7 +41,7 @@ Both permissions are required; see [Permissions](#permissions). `workflow_dispat
 
 Commit and track `facets.lock` alongside `facets.json`. The action rejects a missing, ignored, or untracked lockfile: a clean working tree alone is not evidence that the lockfile records the proposed versions.
 
-The standard workflow assumes a GitHub-hosted Ubuntu runner with Bash, Git, Node/npm (`npx`), and the GitHub CLI available. It also needs outbound network access to GitHub (checkout, push, and pull-request API calls) and the npm registry (the pinned CLI install). GitHub publishes the current hosted-runner tool inventory in [actions/runner-images](https://github.com/actions/runner-images); self-hosted runners must provide equivalent tools and network access.
+The standard workflow assumes a GitHub-hosted Ubuntu runner with Bash, Git, Node/npm (`npx`), and the GitHub CLI available. It also needs outbound network access to GitHub (checkout, push, and pull-request API calls) and the npm registry (the pinned CLI and adapter installs). GitHub publishes the current hosted-runner tool inventory in [actions/runner-images](https://github.com/actions/runner-images); self-hosted runners must provide equivalent tools and network access.
 
 ## Choosing a schedule
 
@@ -60,8 +61,9 @@ The standard workflow assumes a GitHub-hosted Ubuntu runner with Bash, Git, Node
 | --- | --- | --- |
 | `strategy` | `latest` | `latest` or `in-range`. |
 | `cli-version` | `0.33.1` | Version of the `agent-facets` CLI to run. Pin it deliberately; see [Supply chain](#supply-chain). |
+| `adapter` | required | First-party materialization adapter as an exact `claude-code@M.N.P`, `opencode@M.N.P`, or `codex@M.N.P` release. |
 | `working-directory` | `.` | Directory holding `facets.json`. |
-| `dry-run` | `false` | Reports the action's dry-run result and makes no GitHub mutations. |
+| `dry-run` | `false` | Reports the action's dry-run result and makes no GitHub mutations; adapter setup can still install runner-local code. |
 | `open-pr` | `true` | Opens or refreshes a pull request when facets change. |
 | `branch` | `facet-updates` | Destination update branch. It cannot be the base or default branch. |
 | `base` | repo default | Branch the pull request targets. |
@@ -105,6 +107,7 @@ jobs:
         with:
           branch: weekly-facet-updates
           cli-version: '0.33.1'
+          adapter: codex@0.9.0
 ```
 
 A closed historical pull request is not reused: the next update creates a new PR. One matching open PR is refreshed as the branch advances. `open-pr: false` can create an absent update branch, but it cannot refresh an existing update branch; use `open-pr: true` for recurring updates.
@@ -126,6 +129,7 @@ The job needs `contents: write` to push and `pull-requests: write` to create or 
     token: ${{ secrets.FACET_UPDATE_TOKEN }}
     pr-author: my-update-app[bot]
     cli-version: '0.33.1'
+    adapter: codex@0.9.0
 ```
 
 GitHub's [workflow-trigger documentation](https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow) describes the special behavior of events created with `GITHUB_TOKEN`.
@@ -144,7 +148,7 @@ GitHub recommends pinning third-party actions to a full commit SHA in its [secur
 
 ## Supply chain
 
-Pin both executable dependencies: use an action SHA when your policy requires the strongest pin, and set `cli-version: '0.33.1'` to prevent the CLI from changing beneath a scheduled run. The action installs the selected CLI through npm, so that version and its install scripts execute with the job's credentials. Keep the action in a dedicated job and expose only the secrets it needs.
+Pin the action and both executable packages separately: use an action SHA when your policy requires the strongest pin, set `cli-version: '0.33.1'` for the CLI, and set `adapter: codex@0.9.0` (or an exact version of another supported first-party adapter) for materialization. The action uses that CLI version to install the selected adapter before updating facets. Both npm packages and their install scripts execute with the job's credentials, including during a dry run. Keep the action in a dedicated job and expose only the secrets it needs.
 
 Only use this action from `schedule` or `workflow_dispatch`; do not run it from `pull_request_target`, where untrusted repository content could influence a privileged job.
 
