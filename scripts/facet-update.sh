@@ -72,6 +72,13 @@ fi
 
 cd "$WORKING_DIR"
 
+TRANSPORT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/facet-update.XXXXXX")"
+trap 'rm -rf "$TRANSPORT_DIR"' EXIT
+BEFORE_FILE="$TRANSPORT_DIR/before.json"
+AFTER_FILE="$TRANSPORT_DIR/after.json"
+CHANGES_FILE="$TRANSPORT_DIR/changes.json"
+SUMMARY_FILE="$TRANSPORT_DIR/summary.md"
+
 if [ ! -f facets.json ]; then
   echo "facet-update: no facets.json in '${WORKING_DIR}' — nothing to update" >&2
   exit 2
@@ -261,7 +268,7 @@ snapshot() {
   '
 }
 
-BEFORE="$(snapshot)"
+snapshot > "$BEFORE_FILE"
 
 FACET_ARGS=(update --accept-mcp)
 [ "$STRATEGY" = "latest" ] && FACET_ARGS+=(--latest)
@@ -281,7 +288,7 @@ if [ "$CLI_STATUS" -ne 0 ]; then
   exit "$CLI_STATUS"
 fi
 
-AFTER="$(snapshot)"
+snapshot > "$AFTER_FILE"
 
 # What changed comes from comparing the lockfile before and after, not from
 # asking git. git cannot answer this reliably: `git diff` is blind to a
@@ -289,9 +296,10 @@ AFTER="$(snapshot)"
 # change even though every facet moved. The lockfile is the ground truth for
 # "what version is installed", so compare that directly.
 # shellcheck disable=SC2016  # the ${...} below are JS template literals, not shell
-CHANGES="$(BEFORE="$BEFORE" AFTER="$AFTER" node -e '
-  const before = JSON.parse(process.env.BEFORE)
-  const after = JSON.parse(process.env.AFTER)
+node -e '
+  const fs = require("fs")
+  const before = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+  const after = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))
   const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key)
   const stable = value => {
     if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`
@@ -312,23 +320,24 @@ CHANGES="$(BEFORE="$BEFORE" AFTER="$AFTER" node -e '
   }
   rows.sort((a, b) => a.name.localeCompare(b.name))
   console.log(JSON.stringify(rows))
-')"
+' "$BEFORE_FILE" "$AFTER_FILE" > "$CHANGES_FILE"
 
-COUNT="$(CHANGES="$CHANGES" node -e 'console.log(JSON.parse(process.env.CHANGES).length)')"
+COUNT="$(node -e 'const fs = require("fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).length)' "$CHANGES_FILE")"
 
 # shellcheck disable=SC2016  # the ${...} below are JS template literals, not shell
-SUMMARY="$(CHANGES="$CHANGES" node -e '
-  const rows = JSON.parse(process.env.CHANGES)
-  if (rows.length === 0) { console.log(""); process.exit(0) }
+node -e '
+  const fs = require("fs")
+  const rows = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+  if (rows.length === 0) process.exit(0)
   const lines = ["| Facet | From | To | |", "| --- | --- | --- | --- |"]
   for (const r of rows) lines.push(`| \`${r.name}\` | ${r.from} | ${r.to} | ${r.kind} |`)
-  console.log(lines.join("\n"))
-')"
+  process.stdout.write(lines.join("\n"))
+' "$CHANGES_FILE" > "$SUMMARY_FILE"
 
 if [ "$DRY_RUN" = "true" ]; then
   CHANGED=false
   COUNT=0
-  SUMMARY=""
+  : > "$SUMMARY_FILE"
 elif [ "$COUNT" -gt 0 ]; then
   CHANGED=true
 else
@@ -336,13 +345,18 @@ else
 fi
 
 echo "facet-update: updated=${CHANGED} count=${COUNT}"
-[ -n "$SUMMARY" ] && printf '%s\n' "$SUMMARY"
+if [ -s "$SUMMARY_FILE" ]; then
+  cat "$SUMMARY_FILE"
+  printf '\n'
+fi
 
 if [ -n "$OUTPUT" ]; then
   {
     echo "updated=${CHANGED}"
     echo "count=${COUNT}"
     # base64 keeps a multi-line markdown table inside a single key=value line.
-    echo "summary=$(printf '%s' "$SUMMARY" | base64 | tr -d '\n')"
+    printf 'summary='
+    base64 < "$SUMMARY_FILE" | tr -d '\n'
+    printf '\n'
   } >> "$OUTPUT"
 fi

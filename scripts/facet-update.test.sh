@@ -22,6 +22,12 @@ assert_equals() {
   [[ "$1" == "$2" ]] || fail "expected '$2', got '$1'"
 }
 
+assert_file_contains() {
+  local file="$1"
+  local expected="$2"
+  grep -Fq -- "$expected" "$file" || fail "expected '$expected' in $file"
+}
+
 write_lock() {
   local destination="$1"
   local lockfile_version="$2"
@@ -30,7 +36,7 @@ write_lock() {
 }
 
 decode_summary() {
-  node -e 'process.stdout.write(Buffer.from(process.argv[1], "base64").toString())' "$1"
+  node -e 'const chunks = []; process.stdin.on("data", chunk => chunks.push(chunk)); process.stdin.on("end", () => process.stdout.write(Buffer.from(Buffer.concat(chunks).toString(), "base64")))'
 }
 
 run_case() {
@@ -40,7 +46,7 @@ run_case() {
   local mode="$4"
   local dry_run="${5:-false}"
   local directory="$TMP/$name"
-  mkdir -p "$directory/bin"
+  mkdir -p "$directory/bin" "$directory/tmp"
   printf '{}\n' > "$directory/facets.json"
   write_lock "$directory" "$lockfile_version" "$before"
   cat > "$directory/bin/npx" <<'EOF'
@@ -57,6 +63,7 @@ case "${FAKE_NPX_MODE:?}" in
   duplicate03) printf '%s\n' '{"lockfileVersion":0.3,"facets":{"alpha":{"source":{"kind":"local","path":"./alpha"},"version":"bad","\u0076ersion":"1.0.0","integrity":"facet-integrity","assets":[]}}}' > facets.lock ;;
   protointegrity) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); l.facets["__proto__"].integrity = "new"; fs.writeFileSync(p, JSON.stringify(l))' ;;
   protoaddremove) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.constructor; const entry = { source: { kind: "local", path: "./proto" }, version: "1.0.0", integrity: "new", assets: [] }; Object.defineProperty(l.facets, "__proto__", { value: entry, enumerable: true, configurable: true, writable: true }); fs.writeFileSync(p, JSON.stringify(l))' ;;
+  largechange) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); for (const entry of Object.values(l.facets)) entry.integrity = "new"; fs.writeFileSync(p, JSON.stringify(l))' ;;
   malformed) printf '{bad\n' > facets.lock ;;
   missing | deleted) rm facets.lock ;;
   unsupported) printf '{"lockfileVersion":0.4,"facets":{}}\n' > facets.lock ;;
@@ -66,7 +73,15 @@ case "${FAKE_NPX_MODE:?}" in
 esac
 EOF
   chmod +x "$directory/bin/npx"
-  PATH="$directory/bin:$PATH" FAKE_NPX_MODE="$mode" FACET_WORKING_DIR="$directory" FACET_DRY_RUN="$dry_run" FACET_OUTPUT="$directory/output" "$SCRIPT" > "$directory/stdout" 2> "$directory/stderr"
+  local status
+  set +e
+  PATH="$directory/bin:$PATH" TMPDIR="$directory/tmp" FAKE_NPX_MODE="$mode" FACET_WORKING_DIR="$directory" FACET_DRY_RUN="$dry_run" FACET_OUTPUT="$directory/output" "$SCRIPT" > "$directory/stdout" 2> "$directory/stderr"
+  status=$?
+  set -e
+  if find "$directory/tmp" -mindepth 1 -print -quit | grep -q .; then
+    fail "$name left transport files behind"
+  fi
+  return "$status"
 }
 
 base02='{"alpha":{"source":{"kind":"registry","registry":"https://cafe.example"},"version":"1.0.0","integrity":"facet-integrity","assets":[{"scope":"project","type":"agent","name":"reviewer","files":[{"path":"agents/reviewer.md","integrity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}}'
@@ -107,16 +122,49 @@ test_prototype_keys() {
   run_case proto-integrity 0.3 "$proto03" protointegrity
   assert_contains "$(cat "$TMP/proto-integrity/stdout")" 'updated=true count=1'
   # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
-  assert_contains "$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/proto-integrity/output")")" '| `__proto__` | 1.0.0 | 1.0.0 | updated |'
+  assert_contains "$(sed -n 's/^summary=//p' "$TMP/proto-integrity/output" | decode_summary)" '| `__proto__` | 1.0.0 | 1.0.0 | updated |'
 
   run_case proto-addremove 0.3 "$constructor03" protoaddremove
   assert_contains "$(cat "$TMP/proto-addremove/stdout")" 'updated=true count=2'
   local summary
-  summary="$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/proto-addremove/output")")"
+  summary="$(sed -n 's/^summary=//p' "$TMP/proto-addremove/output" | decode_summary)"
   # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
   assert_contains "$summary" '| `__proto__` | — | 1.0.0 | added |'
   # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
   assert_contains "$summary" '| `constructor` | 1.0.0 | — | removed |'
+}
+
+test_large_lock() {
+  local facets
+  # shellcheck disable=SC2016  # ${...} below is a JS template literal, not shell
+  facets="$(node -e '
+    const facets = {}
+    for (let index = 0; index < 1800; index += 1) {
+      const name = `facet-${String(index).padStart(4, "0")}-with-a-long-valid-name-for-large-lock-regression`
+      facets[name] = { source: { kind: "local", path: `./${name}` }, version: "1.0.0", integrity: "old", assets: [] }
+    }
+    process.stdout.write(JSON.stringify(facets))
+  ')"
+
+  run_case large-unchanged 0.3 "$facets" unchanged
+  local lock_bytes
+  lock_bytes="$(wc -c < "$TMP/large-unchanged/facets.lock" | tr -d ' ')"
+  [ "$lock_bytes" -gt 163034 ] || fail "large lock is only $lock_bytes bytes"
+  assert_file_contains "$TMP/large-unchanged/stdout" 'updated=false count=0'
+  assert_equals "$(cat "$TMP/large-unchanged/output")" $'updated=false\ncount=0\nsummary='
+
+  run_case large-changed 0.3 "$facets" largechange
+  assert_file_contains "$TMP/large-changed/stdout" 'updated=true count=1800'
+  assert_file_contains "$TMP/large-changed/output" 'count=1800'
+  sed -n 's/^summary=//p' "$TMP/large-changed/output" | decode_summary > "$TMP/large-changed/summary.md"
+  local summary_bytes
+  summary_bytes="$(wc -c < "$TMP/large-changed/summary.md" | tr -d ' ')"
+  [ "$summary_bytes" -gt 163034 ] || fail "large summary is only $summary_bytes bytes"
+  # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
+  assert_file_contains "$TMP/large-changed/summary.md" '| `facet-0000-with-a-long-valid-name-for-large-lock-regression` | 1.0.0 | 1.0.0 | updated |'
+  # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
+  assert_file_contains "$TMP/large-changed/summary.md" '| `facet-1799-with-a-long-valid-name-for-large-lock-regression` | 1.0.0 | 1.0.0 | updated |'
+  printf 'facet-update large-lock tests: PASS lock_bytes=%s summary_bytes=%s count=1800\n' "$lock_bytes" "$summary_bytes"
 }
 
 case "${1:-all}" in
@@ -130,26 +178,31 @@ case "${1:-all}" in
     echo 'facet-update prototype-key tests: PASS'
     exit 0
     ;;
+  large-lock)
+    test_large_lock
+    exit 0
+    ;;
   all) ;;
   *) fail "unknown test selection '$1'" ;;
 esac
 
 test_duplicate_members
 test_prototype_keys
+test_large_lock
 
 run_case version 0.3 "$base03" version
 assert_contains "$(cat "$TMP/version/stdout")" 'updated=true count=1'
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
-assert_contains "$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/version/output")")" '| `alpha` | 1.0.0 | 2.0.0 | updated |'
+assert_contains "$(sed -n 's/^summary=//p' "$TMP/version/output" | decode_summary)" '| `alpha` | 1.0.0 | 2.0.0 | updated |'
 
 run_case integrity 0.3 "$base03" integrity
 assert_contains "$(cat "$TMP/integrity/stdout")" 'updated=true count=1'
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
-assert_contains "$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/integrity/output")")" '| `alpha` | 1.0.0 | 1.0.0 | updated |'
+assert_contains "$(sed -n 's/^summary=//p' "$TMP/integrity/output" | decode_summary)" '| `alpha` | 1.0.0 | 1.0.0 | updated |'
 
 run_case addremove 0.3 "${base03//alpha/old}" addremove
 assert_contains "$(cat "$TMP/addremove/stdout")" 'updated=true count=2'
-SUMMARY="$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/addremove/output")")"
+SUMMARY="$(sed -n 's/^summary=//p' "$TMP/addremove/output" | decode_summary)"
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
 assert_contains "$SUMMARY" '| `new` | — | 1.0.0 | added |'
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
