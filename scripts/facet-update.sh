@@ -93,24 +93,109 @@ snapshot() {
   # shellcheck disable=SC2016  # ${...} below is a JS template literal, not shell
   node -e '
     const fs = require("fs")
+    const object = (value, path) => {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${path} must be an object`)
+      }
+      return value
+    }
+    const string = (value, path) => {
+      if (typeof value !== "string") throw new Error(`${path} must be a string`)
+      return value
+    }
+    const oneOf = (value, choices, path) => {
+      if (!choices.includes(value)) throw new Error(`${path} must be one of ${choices.join(", ")}`)
+      return value
+    }
+    const assetSegment = (value, path) => {
+      string(value, path)
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value) || value.length > 64) {
+        throw new Error(`${path} must be a lowercase asset-name segment`)
+      }
+    }
+    const safePath = (value, path) => {
+      string(value, path)
+      if (value.includes("\\") || value.split("/").some(segment => ["", ".", ".."].includes(segment))) {
+        throw new Error(`${path} must be a safe relative path`)
+      }
+    }
+    const source = (value, path) => {
+      object(value, path)
+      oneOf(value.kind, ["registry", "git", "local"], `${path}.kind`)
+      if (value.kind === "registry") string(value.registry, `${path}.registry`)
+      if (value.kind === "local") string(value.path, `${path}.path`)
+      if (value.kind === "git") {
+        string(value.url, `${path}.url`)
+        string(value.commit, `${path}.commit`)
+        if (!/^[0-9a-f]{8,}$/.test(value.commit)) {
+          throw new Error(`${path}.commit must be a lowercase hex commit SHA of at least 8 characters`)
+        }
+      }
+    }
+    const version = (value, path) => {
+      string(value, path)
+      const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value)
+      if (match === null || !match.slice(1).every(component => Number.isSafeInteger(Number(component)))) {
+        throw new Error(`${path} must be an exact M.N.P version with safe numeric components`)
+      }
+    }
+    const materialization = (value, path) => {
+      object(value, path)
+      oneOf(value.kind, ["authored", "aliased", "omitted"], `${path}.kind`)
+      if (value.kind === "aliased") assetSegment(value.as, `${path}.as`)
+      else if ("as" in value) throw new Error(`${path}.as is only valid for aliased materialization`)
+    }
+    const asset = (value, lockfileVersion, path) => {
+      object(value, path)
+      oneOf(value.scope, ["system", "user", "project"], `${path}.scope`)
+      oneOf(value.type, ["skill", "agent", "command"], `${path}.type`)
+      safePath(value.name, `${path}.name`)
+      if (lockfileVersion === 0.3) materialization(value.materialization, `${path}.materialization`)
+      if (!Array.isArray(value.files)) throw new Error(`${path}.files must be an array`)
+      if (value.files.length === 0) throw new Error(`${path}.files must contain at least one file`)
+      let previous = null
+      for (let index = 0; index < value.files.length; index += 1) {
+        const file = object(value.files[index], `${path}.files[${index}]`)
+        safePath(file.path, `${path}.files[${index}].path`)
+        string(file.integrity, `${path}.files[${index}].integrity`)
+        if (!/^sha256:[a-f0-9]{64}$/.test(file.integrity)) {
+          throw new Error(`${path}.files[${index}].integrity must be sha256 followed by 64 lowercase hex characters`)
+        }
+        if (previous !== null && file.path <= previous) {
+          throw new Error(`${path}.files must be sorted by path with no duplicates`)
+        }
+        previous = file.path
+      }
+      const primary = `${value.type}s/${value.name}${value.type === "skill" ? "/SKILL.md" : ".md"}`
+      if (value.type === "skill") {
+        const root = `skills/${value.name}/`
+        if (!value.files.some(file => file.path === primary) || value.files.some(file => !file.path.startsWith(root))) {
+          throw new Error(`${path}.files must contain ${primary} and stay under ${root}`)
+        }
+      } else if (value.files.length !== 1 || value.files[0].path !== primary) {
+        throw new Error(`${path}.files must contain only ${primary}`)
+      }
+    }
+    const entry = (value, lockfileVersion, path) => {
+      object(value, path)
+      source(value.source, `${path}.source`)
+      version(value.version, `${path}.version`)
+      string(value.integrity, `${path}.integrity`)
+      if (!Array.isArray(value.assets)) throw new Error(`${path}.assets must be an array`)
+      value.assets.forEach((item, index) => asset(item, lockfileVersion, `${path}.assets[${index}]`))
+    }
     try {
       if (!fs.existsSync("facets.lock")) throw new Error("file is missing")
       const lock = JSON.parse(fs.readFileSync("facets.lock", "utf8"))
-      if (lock === null || typeof lock !== "object" || Array.isArray(lock)) {
-        throw new Error("root must be an object")
-      }
+      object(lock, "root")
       if (lock.lockfileVersion !== 0.2 && lock.lockfileVersion !== 0.3) {
         throw new Error("lockfileVersion must be numeric 0.2 or 0.3")
       }
-      if (lock.facets === null || typeof lock.facets !== "object" || Array.isArray(lock.facets)) {
-        throw new Error("facets must be an object")
-      }
+      object(lock.facets, "facets")
       const out = {}
-      for (const [name, entry] of Object.entries(lock.facets)) {
-        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
-          throw new Error(`facet ${name} must be an object`)
-        }
-        out[name] = entry
+      for (const [name, value] of Object.entries(lock.facets)) {
+        entry(value, lock.lockfileVersion, `facet ${name}`)
+        out[name] = value
       }
       console.log(JSON.stringify(out))
     } catch (err) {

@@ -24,26 +24,35 @@ assert_equals() {
 
 write_lock() {
   local destination="$1"
-  local facets="$2"
-  printf '{"lockfileVersion":0.3,"facets":%s}\n' "$facets" > "$destination/facets.lock"
+  local lockfile_version="$2"
+  local facets="$3"
+  printf '{"lockfileVersion":%s,"facets":%s}\n' "$lockfile_version" "$facets" > "$destination/facets.lock"
+}
+
+decode_summary() {
+  node -e 'process.stdout.write(Buffer.from(process.argv[1], "base64").toString())' "$1"
 }
 
 run_case() {
   local name="$1"
-  local before="$2"
-  local mode="$3"
-  local dry_run="${4:-false}"
+  local lockfile_version="$2"
+  local before="$3"
+  local mode="$4"
+  local dry_run="${5:-false}"
   local directory="$TMP/$name"
   mkdir -p "$directory/bin"
   printf '{}\n' > "$directory/facets.json"
-  write_lock "$directory" "$before"
+  write_lock "$directory" "$lockfile_version" "$before"
   cat > "$directory/bin/npx" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${FAKE_NPX_MODE:?}" in
   version) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); l.facets.alpha.version = "2.0.0"; fs.writeFileSync(p, JSON.stringify(l))' ;;
   integrity) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); l.facets.alpha.integrity = "sha512-new"; fs.writeFileSync(p, JSON.stringify(l))' ;;
-  addremove) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.old; l.facets.new = { source: "npm", version: "1.0.0", integrity: "sha512-new", assets: [] }; fs.writeFileSync(p, JSON.stringify(l))' ;;
+  addremove) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.old; l.facets.new = { source: { kind: "local", path: "./new" }, version: "1.0.0", integrity: "facet-integrity", assets: [] }; fs.writeFileSync(p, JSON.stringify(l))' ;;
+  incomplete) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.alpha.assets; fs.writeFileSync(p, JSON.stringify(l))' ;;
+  badtype) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); l.facets.alpha.source = "npm"; fs.writeFileSync(p, JSON.stringify(l))' ;;
+  missingmaterialization) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.alpha.assets[0].materialization; fs.writeFileSync(p, JSON.stringify(l))' ;;
   malformed) printf '{bad\n' > facets.lock ;;
   missing | deleted) rm facets.lock ;;
   unsupported) printf '{"lockfileVersion":0.4,"facets":{}}\n' > facets.lock ;;
@@ -56,32 +65,80 @@ EOF
   PATH="$directory/bin:$PATH" FAKE_NPX_MODE="$mode" FACET_WORKING_DIR="$directory" FACET_DRY_RUN="$dry_run" FACET_OUTPUT="$directory/output" "$SCRIPT" > "$directory/stdout" 2> "$directory/stderr"
 }
 
-base='{"alpha":{"source":"npm","version":"1.0.0","integrity":"sha512-old","assets":[]}}'
+base02='{"alpha":{"source":{"kind":"registry","registry":"https://cafe.example"},"version":"1.0.0","integrity":"facet-integrity","assets":[{"scope":"project","type":"agent","name":"reviewer","files":[{"path":"agents/reviewer.md","integrity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}}'
+base03='{"alpha":{"source":{"kind":"registry","registry":"https://cafe.example"},"version":"1.0.0","integrity":"facet-integrity","assets":[{"scope":"project","type":"agent","name":"reviewer","materialization":{"kind":"authored"},"files":[{"path":"agents/reviewer.md","integrity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}}'
 
-run_case version "$base" version
+run_case version 0.3 "$base03" version
 assert_contains "$(cat "$TMP/version/stdout")" 'updated=true count=1'
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
-assert_contains "$(base64 -D < <(sed -n 's/^summary=//p' "$TMP/version/output"))" '| `alpha` | 1.0.0 | 2.0.0 | updated |'
+assert_contains "$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/version/output")")" '| `alpha` | 1.0.0 | 2.0.0 | updated |'
 
-run_case integrity "$base" integrity
+run_case integrity 0.3 "$base03" integrity
 assert_contains "$(cat "$TMP/integrity/stdout")" 'updated=true count=1'
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
-assert_contains "$(base64 -D < <(sed -n 's/^summary=//p' "$TMP/integrity/output"))" '| `alpha` | 1.0.0 | 1.0.0 | updated |'
+assert_contains "$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/integrity/output")")" '| `alpha` | 1.0.0 | 1.0.0 | updated |'
 
-run_case addremove '{"old":{"source":"npm","version":"1.0.0","integrity":"sha512-old","assets":[]}}' addremove
+run_case addremove 0.3 "${base03//alpha/old}" addremove
 assert_contains "$(cat "$TMP/addremove/stdout")" 'updated=true count=2'
-SUMMARY="$(base64 -D < <(sed -n 's/^summary=//p' "$TMP/addremove/output"))"
+SUMMARY="$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/addremove/output")")"
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
 assert_contains "$SUMMARY" '| `new` | — | 1.0.0 | added |'
 # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
 assert_contains "$SUMMARY" '| `old` | 1.0.0 | — | removed |'
 
 for invalid in malformed missing deleted unsupported; do
-  if run_case "$invalid" "$base" "$invalid"; then
+  if run_case "$invalid" 0.3 "$base03" "$invalid"; then
     fail "$invalid post-lock unexpectedly succeeded"
   fi
   assert_contains "$(cat "$TMP/$invalid/stderr")" 'facet-update: invalid facets.lock'
 done
+
+run_case valid02 0.2 "$base02" unchanged
+assert_contains "$(cat "$TMP/valid02/stdout")" 'updated=false count=0'
+run_case valid03 0.3 "$base03" unchanged
+assert_contains "$(cat "$TMP/valid03/stdout")" 'updated=false count=0'
+
+PRE_INCOMPLETE="$TMP/pre-incomplete"
+mkdir -p "$PRE_INCOMPLETE"
+printf '{}\n' > "$PRE_INCOMPLETE/facets.json"
+write_lock "$PRE_INCOMPLETE" 0.2 '{"alpha":{"source":{"kind":"local","path":"./alpha"},"version":"1.0.0","integrity":"facet-integrity"}}'
+if FACET_WORKING_DIR="$PRE_INCOMPLETE" "$SCRIPT" > "$PRE_INCOMPLETE/stdout" 2> "$PRE_INCOMPLETE/stderr"; then
+  fail 'incomplete pre-lock unexpectedly succeeded'
+fi
+assert_contains "$(cat "$PRE_INCOMPLETE/stderr")" 'facet-update: invalid facets.lock (facet alpha.assets must be an array)'
+
+PRE_BAD_TYPE="$TMP/pre-bad-type"
+mkdir -p "$PRE_BAD_TYPE"
+printf '{}\n' > "$PRE_BAD_TYPE/facets.json"
+write_lock "$PRE_BAD_TYPE" 0.3 '{"alpha":{"source":"npm","version":"1.0.0","integrity":"facet-integrity","assets":[]}}'
+if FACET_WORKING_DIR="$PRE_BAD_TYPE" "$SCRIPT" > "$PRE_BAD_TYPE/stdout" 2> "$PRE_BAD_TYPE/stderr"; then
+  fail 'bad-type pre-lock unexpectedly succeeded'
+fi
+assert_contains "$(cat "$PRE_BAD_TYPE/stderr")" 'facet-update: invalid facets.lock (facet alpha.source must be an object)'
+
+PRE_MATERIALIZATION="$TMP/pre-materialization"
+mkdir -p "$PRE_MATERIALIZATION"
+printf '{}\n' > "$PRE_MATERIALIZATION/facets.json"
+write_lock "$PRE_MATERIALIZATION" 0.3 "$base02"
+if FACET_WORKING_DIR="$PRE_MATERIALIZATION" "$SCRIPT" > "$PRE_MATERIALIZATION/stdout" 2> "$PRE_MATERIALIZATION/stderr"; then
+  fail '0.3 pre-lock without materialization unexpectedly succeeded'
+fi
+assert_contains "$(cat "$PRE_MATERIALIZATION/stderr")" 'facet-update: invalid facets.lock (facet alpha.assets[0].materialization must be an object)'
+
+if run_case post-incomplete 0.3 "$base03" incomplete; then
+  fail 'incomplete post-entry unexpectedly succeeded'
+fi
+assert_contains "$(cat "$TMP/post-incomplete/stderr")" 'facet-update: invalid facets.lock (facet alpha.assets must be an array)'
+
+if run_case post-badtype 0.3 "$base03" badtype; then
+  fail 'bad-type post-entry unexpectedly succeeded'
+fi
+assert_contains "$(cat "$TMP/post-badtype/stderr")" 'facet-update: invalid facets.lock (facet alpha.source must be an object)'
+
+if run_case post-missingmaterialization 0.3 "$base03" missingmaterialization; then
+  fail '0.3 post-entry without materialization unexpectedly succeeded'
+fi
+assert_contains "$(cat "$TMP/post-missingmaterialization/stderr")" 'facet-update: invalid facets.lock (facet alpha.assets[0].materialization must be an object)'
 
 PRE_DIR="$TMP/pre-missing"
 mkdir -p "$PRE_DIR/bin"
@@ -91,13 +148,13 @@ if PATH="$PRE_DIR/bin:$PATH" FACET_WORKING_DIR="$PRE_DIR" "$SCRIPT" > "$PRE_DIR/
 fi
 assert_contains "$(cat "$PRE_DIR/stderr")" 'facet-update: no facets.lock'
 
-run_case unchanged "$base" unchanged
+run_case unchanged 0.3 "$base03" unchanged
 assert_contains "$(cat "$TMP/unchanged/stdout")" 'updated=false count=0'
 
 DRY_DIR="$TMP/dryrun"
 mkdir -p "$DRY_DIR/bin"
 printf '{}\n' > "$DRY_DIR/facets.json"
-write_lock "$DRY_DIR" "$base"
+write_lock "$DRY_DIR" 0.3 "$base03"
 cat > "$DRY_DIR/bin/npx" <<'EOF'
 #!/usr/bin/env bash
 exit 0
