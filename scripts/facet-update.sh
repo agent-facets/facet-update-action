@@ -93,6 +93,57 @@ snapshot() {
   # shellcheck disable=SC2016  # ${...} below is a JS template literal, not shell
   node -e '
     const fs = require("fs")
+    const findDuplicateJsonMember = text => {
+      const stack = []
+      let expectKey = false
+      let pendingSegment = ""
+      let index = 0
+      const currentPath = () => stack.map(frame => frame.pathSegment).filter(Boolean).join(".")
+      while (index < text.length) {
+        const character = text[index]
+        if (character === "\"") {
+          let end = index + 1
+          while (end < text.length) {
+            if (text[end] === "\\") {
+              end += 2
+              continue
+            }
+            if (text[end] === "\"") break
+            end += 1
+          }
+          const top = stack[stack.length - 1]
+          if (top?.kind === "object" && expectKey) {
+            const key = JSON.parse(text.slice(index, end + 1))
+            if (top.keys.has(key)) return { key, path: currentPath() || "root" }
+            top.keys.add(key)
+            pendingSegment = key
+            expectKey = false
+          }
+          index = end + 1
+          continue
+        }
+        if (character === "{") {
+          stack.push({ kind: "object", keys: new Set(), pathSegment: pendingSegment })
+          pendingSegment = ""
+          expectKey = true
+        } else if (character === "[") {
+          stack.push({ kind: "array", index: 0, pathSegment: pendingSegment })
+          pendingSegment = "0"
+        } else if (character === "}" || character === "]") {
+          stack.pop()
+          pendingSegment = ""
+        } else if (character === ",") {
+          const top = stack[stack.length - 1]
+          if (top?.kind === "object") expectKey = true
+          else if (top?.kind === "array") {
+            top.index += 1
+            pendingSegment = String(top.index)
+          }
+        }
+        index += 1
+      }
+      return null
+    }
     const object = (value, path) => {
       if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new Error(`${path} must be an object`)
@@ -186,13 +237,18 @@ snapshot() {
     }
     try {
       if (!fs.existsSync("facets.lock")) throw new Error("file is missing")
-      const lock = JSON.parse(fs.readFileSync("facets.lock", "utf8"))
+      const text = fs.readFileSync("facets.lock", "utf8")
+      const lock = JSON.parse(text)
+      const duplicate = findDuplicateJsonMember(text)
+      if (duplicate !== null) {
+        throw new Error(`duplicate JSON object member ${JSON.stringify(duplicate.key)} at ${duplicate.path}`)
+      }
       object(lock, "root")
       if (lock.lockfileVersion !== 0.2 && lock.lockfileVersion !== 0.3) {
         throw new Error("lockfileVersion must be numeric 0.2 or 0.3")
       }
       object(lock.facets, "facets")
-      const out = {}
+      const out = Object.create(null)
       for (const [name, value] of Object.entries(lock.facets)) {
         entry(value, lock.lockfileVersion, `facet ${name}`)
         out[name] = value
@@ -236,6 +292,7 @@ AFTER="$(snapshot)"
 CHANGES="$(BEFORE="$BEFORE" AFTER="$AFTER" node -e '
   const before = JSON.parse(process.env.BEFORE)
   const after = JSON.parse(process.env.AFTER)
+  const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key)
   const stable = value => {
     if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`
     if (value && typeof value === "object") {
@@ -247,11 +304,11 @@ CHANGES="$(BEFORE="$BEFORE" AFTER="$AFTER" node -e '
   const rows = []
   for (const [name, to] of Object.entries(after)) {
     const from = before[name]
-    if (from === undefined) rows.push({ name, from: "—", to: displayVersion(to), kind: "added" })
+    if (!hasOwn(before, name)) rows.push({ name, from: "—", to: displayVersion(to), kind: "added" })
     else if (stable(from) !== stable(to)) rows.push({ name, from: displayVersion(from), to: displayVersion(to), kind: "updated" })
   }
   for (const name of Object.keys(before)) {
-    if (!(name in after)) rows.push({ name, from: displayVersion(before[name]), to: "—", kind: "removed" })
+    if (!hasOwn(after, name)) rows.push({ name, from: displayVersion(before[name]), to: "—", kind: "removed" })
   }
   rows.sort((a, b) => a.name.localeCompare(b.name))
   console.log(JSON.stringify(rows))

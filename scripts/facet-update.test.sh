@@ -53,6 +53,10 @@ case "${FAKE_NPX_MODE:?}" in
   incomplete) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.alpha.assets; fs.writeFileSync(p, JSON.stringify(l))' ;;
   badtype) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); l.facets.alpha.source = "npm"; fs.writeFileSync(p, JSON.stringify(l))' ;;
   missingmaterialization) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.alpha.assets[0].materialization; fs.writeFileSync(p, JSON.stringify(l))' ;;
+  duplicate02) printf '%s\n' '{"lockfileVersion":0.2,"facets":{"alpha":{"source":{"kind":"local","path":"./alpha"},"version":"bad","\u0076ersion":"1.0.0","integrity":"facet-integrity","assets":[]}}}' > facets.lock ;;
+  duplicate03) printf '%s\n' '{"lockfileVersion":0.3,"facets":{"alpha":{"source":{"kind":"local","path":"./alpha"},"version":"bad","\u0076ersion":"1.0.0","integrity":"facet-integrity","assets":[]}}}' > facets.lock ;;
+  protointegrity) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); l.facets["__proto__"].integrity = "new"; fs.writeFileSync(p, JSON.stringify(l))' ;;
+  protoaddremove) node -e 'const fs = require("fs"); const p = "facets.lock"; const l = JSON.parse(fs.readFileSync(p)); delete l.facets.constructor; const entry = { source: { kind: "local", path: "./proto" }, version: "1.0.0", integrity: "new", assets: [] }; Object.defineProperty(l.facets, "__proto__", { value: entry, enumerable: true, configurable: true, writable: true }); fs.writeFileSync(p, JSON.stringify(l))' ;;
   malformed) printf '{bad\n' > facets.lock ;;
   missing | deleted) rm facets.lock ;;
   unsupported) printf '{"lockfileVersion":0.4,"facets":{}}\n' > facets.lock ;;
@@ -67,6 +71,71 @@ EOF
 
 base02='{"alpha":{"source":{"kind":"registry","registry":"https://cafe.example"},"version":"1.0.0","integrity":"facet-integrity","assets":[{"scope":"project","type":"agent","name":"reviewer","files":[{"path":"agents/reviewer.md","integrity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}}'
 base03='{"alpha":{"source":{"kind":"registry","registry":"https://cafe.example"},"version":"1.0.0","integrity":"facet-integrity","assets":[{"scope":"project","type":"agent","name":"reviewer","materialization":{"kind":"authored"},"files":[{"path":"agents/reviewer.md","integrity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}}'
+entry03='{"source":{"kind":"local","path":"./facet"},"version":"1.0.0","integrity":"old","assets":[]}'
+proto03="{\"__proto__\":$entry03}"
+constructor03="{\"constructor\":$entry03}"
+duplicate02='{"lockfileVersion":0.2,"facets":{"alpha":{"source":{"kind":"local","path":"./alpha"},"version":"bad","\u0076ersion":"1.0.0","integrity":"facet-integrity","assets":[]}}}'
+duplicate03='{"lockfileVersion":0.3,"facets":{"alpha":{"source":{"kind":"local","path":"./alpha"},"version":"bad","\u0076ersion":"1.0.0","integrity":"facet-integrity","assets":[]}}}'
+
+assert_duplicate_pre_fails() {
+  local name="$1"
+  local document="$2"
+  local directory="$TMP/$name"
+  mkdir -p "$directory"
+  printf '{}\n' > "$directory/facets.json"
+  printf '%s\n' "$document" > "$directory/facets.lock"
+  if FACET_WORKING_DIR="$directory" "$SCRIPT" > "$directory/stdout" 2> "$directory/stderr"; then
+    fail "$name unexpectedly succeeded"
+  fi
+  assert_contains "$(cat "$directory/stderr")" 'facet-update: invalid facets.lock (duplicate JSON object member "version" at facets.alpha)'
+}
+
+test_duplicate_members() {
+  assert_duplicate_pre_fails duplicate-02-pre "$duplicate02"
+  assert_duplicate_pre_fails duplicate-03-pre "$duplicate03"
+  if run_case duplicate-02-post 0.2 "$base02" duplicate02; then
+    fail 'duplicate 0.2 post-lock unexpectedly succeeded'
+  fi
+  assert_contains "$(cat "$TMP/duplicate-02-post/stderr")" 'facet-update: invalid facets.lock (duplicate JSON object member "version" at facets.alpha)'
+  if run_case duplicate-03-post 0.3 "$base03" duplicate03; then
+    fail 'duplicate 0.3 post-lock unexpectedly succeeded'
+  fi
+  assert_contains "$(cat "$TMP/duplicate-03-post/stderr")" 'facet-update: invalid facets.lock (duplicate JSON object member "version" at facets.alpha)'
+}
+
+test_prototype_keys() {
+  run_case proto-integrity 0.3 "$proto03" protointegrity
+  assert_contains "$(cat "$TMP/proto-integrity/stdout")" 'updated=true count=1'
+  # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
+  assert_contains "$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/proto-integrity/output")")" '| `__proto__` | 1.0.0 | 1.0.0 | updated |'
+
+  run_case proto-addremove 0.3 "$constructor03" protoaddremove
+  assert_contains "$(cat "$TMP/proto-addremove/stdout")" 'updated=true count=2'
+  local summary
+  summary="$(decode_summary "$(sed -n 's/^summary=//p' "$TMP/proto-addremove/output")")"
+  # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
+  assert_contains "$summary" '| `__proto__` | — | 1.0.0 | added |'
+  # shellcheck disable=SC2016  # backticks are literal markdown in the expected table
+  assert_contains "$summary" '| `constructor` | 1.0.0 | — | removed |'
+}
+
+case "${1:-all}" in
+  duplicate-members)
+    test_duplicate_members
+    echo 'facet-update duplicate-member tests: PASS'
+    exit 0
+    ;;
+  prototype-keys)
+    test_prototype_keys
+    echo 'facet-update prototype-key tests: PASS'
+    exit 0
+    ;;
+  all) ;;
+  *) fail "unknown test selection '$1'" ;;
+esac
+
+test_duplicate_members
+test_prototype_keys
 
 run_case version 0.3 "$base03" version
 assert_contains "$(cat "$TMP/version/stdout")" 'updated=true count=1'
